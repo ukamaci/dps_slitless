@@ -1,4 +1,7 @@
-import math
+import math, glob
+from slitless.forward import Source
+import matplotlib.pyplot as plt
+import numpy as np
 import copy
 from pathlib import Path
 from random import random
@@ -80,11 +83,57 @@ def convert_image_to_fn(img_type, image):
 
 # normalization functions
 
-def normalize_to_neg_one_to_one(img):
-    return img * 2 - 1
+def normalize_to_neg_one_to_one(img, mode='all'):
+    if mode=='all':
+        img[:,0] = img[:,0] * 2 - 1
+        img[:,1] = img[:,1] / 2
+        img[:,2] = 2*(img[:,2]-0.98765432)/1.3 - 1
+    elif mode=='int':
+        img = img * 2 - 1
+    elif mode=='vel':
+        img = img / 2
+    elif mode=='width':
+        img = 2*(img-0.98765432)/1.3 - 1
+    return img
 
-def unnormalize_to_zero_to_one(t):
-    return (t + 1) * 0.5
+def unnormalize_to_zero_to_one(img, mode='all'):
+    if mode=='all':
+        img[:,0] = (img[:,0] + 1) / 2
+        img[:,1] = img[:,1] * 2
+        img[:,2] = (img[:,2] + 1) / 2 * 1.3 + 0.98765432
+    elif mode=='int':
+        img = (img + 1) / 2
+    elif mode=='vel':
+        img = img * 2
+    elif mode=='width':
+        img = (img + 1) / 2 * 1.3 + 0.98765432
+    return img
+
+# def normalize_to_neg_one_to_one(img, mode='all'):
+#     if mode=='all':
+#         img[:,0] = img[:,0] * 2 - 1
+#         img[:,1] = img[:,1] * 2
+#         img[:,2] = 2*(img[:,2]-1)/0.8 - 1
+#     elif mode=='int':
+#         img = img * 2 - 1
+#     elif mode=='vel':
+#         img = img * 2
+#     elif mode=='width':
+#         img = 2*(img-1)/0.8 - 1
+#     return img
+
+# def unnormalize_to_zero_to_one(img, mode='all'):
+#     if mode=='all':
+#         img[:,0] = (img[:,0] + 1) / 2
+#         img[:,1] = img[:,1] / 2
+#         img[:,2] = (img[:,2] + 1) / 2 * 0.8 + 1
+#     elif mode=='int':
+#         img = (img + 1) / 2
+#     elif mode=='vel':
+#         img = img / 2
+#     elif mode=='width':
+#         img = (img + 1) / 2 * 0.8 + 1
+#     return img
 
 # small helper modules
 
@@ -480,27 +529,44 @@ class GaussianDiffusion(Module):
         self,
         model,
         *,
+        mode='all',
         image_size,
         timesteps = 1000,
+        recon = False,
+        measurement = None,
+        grad_scale = 1.,
+        forward_op=None,
+        true = None,
         sampling_timesteps = None,
         objective = 'pred_v',
-        beta_schedule = 'sigmoid',
+        beta_schedule = 'cosine',
         schedule_fn_kwargs = dict(),
         ddim_sampling_eta = 0.,
         auto_normalize = True,
         offset_noise_strength = 0.,  # https://www.crosslabs.org/blog/diffusion-with-offset-noise
         min_snr_loss_weight = False, # https://arxiv.org/abs/2303.09556
         min_snr_gamma = 5,
-        immiscible = False
+        immiscible = False,
+        device=None
     ):
         super().__init__()
+        if device is None:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
         assert not (type(self) == GaussianDiffusion and model.channels != model.out_dim)
         assert not hasattr(model, 'random_or_learned_sinusoidal_cond') or not model.random_or_learned_sinusoidal_cond
 
         self.model = model
+        self.true = true
+        self.mode = mode
 
         self.channels = self.model.channels
         self.self_condition = self.model.self_condition
+        self.recon = recon
+        if recon:
+            self.measurement = measurement
+            self.grad_scale = grad_scale
+            self.forward_op = forward_op
 
         if isinstance(image_size, int):
             image_size = (image_size, image_size)
@@ -539,7 +605,7 @@ class GaussianDiffusion(Module):
 
         # helper function to register buffer from float64 to float32
 
-        register_buffer = lambda name, val: self.register_buffer(name, val.to(torch.float32))
+        register_buffer = lambda name, val: self.register_buffer(name, val.to(torch.float32).to(device))
 
         register_buffer('betas', betas)
         register_buffer('alphas_cumprod', alphas_cumprod)
@@ -597,6 +663,8 @@ class GaussianDiffusion(Module):
 
         self.normalize = normalize_to_neg_one_to_one if auto_normalize else identity
         self.unnormalize = unnormalize_to_zero_to_one if auto_normalize else identity
+        if recon:
+            self.measurement = self.measurement.to(self.device)
 
     @property
     def device(self):
@@ -670,35 +738,112 @@ class GaussianDiffusion(Module):
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start = x_start, x_t = x, t = t)
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
-    @torch.inference_mode()
+    # @torch.inference_mode()
     def p_sample(self, x, t: int, x_self_cond = None):
         b, *_, device = *x.shape, self.device
         batched_times = torch.full((b,), t, device = device, dtype = torch.long)
-        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = True)
+        if not self.recon:
+            with torch.no_grad():
+                model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = True)
+        else:
+            model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = True)
         noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
         pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
         return pred_img, x_start
 
-    @torch.inference_mode()
+    def grad_and_value(self, x_prev, x_0_hat, measurement):
+        x_0_hat = self.unnormalize(x_0_hat, mode=self.mode) # unnormalize x_0_hat before fwd_op
+        difference = measurement - self.forward_op(x_0_hat, device=self.device)
+        # norm = torch.sqrt(torch.sum(difference**2, dim=(1,2,3))).sum()
+        norm = torch.sum(difference**2, dim=(1,2,3)).sum()
+        norm_grad = torch.autograd.grad(outputs=norm, inputs=x_prev)[0]
+        return norm_grad, norm
+
+    def p_sample_loop_2(self, shape, return_all_timesteps = False):
+        batch, device = shape[0], self.device
+
+        img = torch.randn(shape, device = device, requires_grad = True)
+        pred_img, x_start = self.p_sample(img, self.num_timesteps)
+        img[:,0] = self.normalize(self.pred_int, mode='int')
+
+        x_start = None
+        norms = []
+        grad_norms = []
+        rmses = []
+
+        for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
+            img = img.requires_grad_()
+            pred_img, x_start = self.p_sample(img, t, self_cond)
+            norm_grad, norm = self.grad_and_value(
+                x_prev=img, 
+                x_0_hat=x_start, 
+                measurement=self.measurement
+            )
+            img = pred_img - norm_grad * self.grad_scale [None,:,None,None]
+            img = img.detach_()
+            pred_img = pred_img.detach_()
+            x_start = x_start.detach_()
+
+            rmses.append(torch.sqrt(torch.mean((self.unnormalize(img.detach().clone(), mode=self.mode) - self.true)**2, dim=(-1,-2))).cpu().numpy())
+            norms.append(norm.detach().cpu().numpy())
+            grad_norms.append(torch.linalg.norm(norm_grad.detach()).cpu().numpy())
+
+        img = self.unnormalize(img, mode=self.mode)
+        return img, norms, grad_norms, rmses
+
+    # @torch.inference_mode()
     def p_sample_loop(self, shape, return_all_timesteps = False):
         batch, device = shape[0], self.device
 
-        img = torch.randn(shape, device = device)
-        imgs = [img]
+        if self.recon:
+            img = torch.randn(shape, device = device, requires_grad = True)
+        else:
+            img = torch.randn(shape, device = device, requires_grad = False)
+        # imgs = [img.clone()]
+
+        # Source(param3d=self.unnormalize(img.detach().cpu().numpy())[0], pix=True).plot('Recon - INIT')
+        # plt.pause(0.1)
 
         x_start = None
+        norms = []
+        grad_norms = []
+        rmses = []
 
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
             self_cond = x_start if self.self_condition else None
-            img, x_start = self.p_sample(img, t, self_cond)
-            imgs.append(img)
+            if self.recon:
+                img = img.requires_grad_()
+                pred_img, x_start = self.p_sample(img, t, self_cond)
 
-        ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
+                norm_grad, norm = self.grad_and_value(
+                    x_prev=img, 
+                    x_0_hat=x_start, 
+                    measurement=self.measurement
+                )
+                img = pred_img - norm_grad * self.grad_scale [None,:,None,None]
+                img = img.detach_()
+                pred_img = pred_img.detach_()
+                x_start = x_start.detach_()
 
-        ret = self.unnormalize(ret)
-        return ret
+                if self.true is not None:
+                    rmses.append(torch.sqrt(torch.mean((self.unnormalize(img.detach().clone(), mode=self.mode) - self.true)**2, dim=(-1,-2))).cpu().numpy())
+                norms.append(norm.detach().cpu().numpy())
+                grad_norms.append(torch.linalg.norm(norm_grad.detach()).cpu().numpy())
+            else:
+                img, x_start = self.p_sample(img, t, self_cond)
 
-    @torch.inference_mode()
+            # imgs.append(img)
+
+        # ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
+        ret = img
+
+        ret = self.unnormalize(ret, mode=self.mode)
+        if self.recon:
+            return ret, norms, grad_norms, rmses
+        else:
+            return ret
+
+    # @torch.inference_mode()
     def ddim_sample(self, shape, return_all_timesteps = False):
         batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
@@ -706,12 +851,20 @@ class GaussianDiffusion(Module):
         times = list(reversed(times.int().tolist()))
         time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
 
-        img = torch.randn(shape, device = device)
-        imgs = [img]
+        if self.recon:
+            img = torch.randn(shape, device = device, requires_grad = True)
+        else:
+            img = torch.randn(shape, device = device)
+        imgs = [img.clone()]
 
         x_start = None
+        norms = []
+        grad_norms = []
+        rmses = []
 
         for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
+            if self.recon:
+                img = img.requires_grad_()
             time_cond = torch.full((batch,), time, device = device, dtype = torch.long)
             self_cond = x_start if self.self_condition else None
             pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, clip_x_start = True, rederive_pred_noise = True)
@@ -729,18 +882,37 @@ class GaussianDiffusion(Module):
 
             noise = torch.randn_like(img)
 
-            img = x_start * alpha_next.sqrt() + \
-                  c * pred_noise + \
-                  sigma * noise
+            if self.recon:
+                pred_img = x_start * alpha_next.sqrt() + \
+                    c * pred_noise + \
+                    sigma * noise
+                norm_grad, norm = self.grad_and_value(
+                    x_prev=img, 
+                    x_0_hat=x_start, 
+                    measurement=self.measurement
+                )
+                pred_img -= norm_grad * self.grad_scale[None,:,None,None]
+                img = pred_img.detach_()
+                norms.append(norm.detach().cpu().numpy())
+                grad_norms.append(torch.linalg.norm(norm_grad.detach()).cpu().numpy())
+                rmses.append(torch.sqrt(torch.mean((self.unnormalize(img.detach().clone(), mode=self.mode) - self.true)**2, dim=(-1,-2))).cpu().numpy())
 
-            imgs.append(img)
+            else:
+                img = x_start * alpha_next.sqrt() + \
+                    c * pred_noise + \
+                    sigma * noise
+
+            # imgs.append(img)
 
         ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
 
-        ret = self.unnormalize(ret)
-        return ret
+        ret = self.unnormalize(ret, mode=self.mode)
+        if self.recon:
+            return ret, norms, grad_norms, rmses
+        else:
+            return ret
 
-    @torch.inference_mode()
+    # @torch.inference_mode()
     def sample(self, batch_size = 16, return_all_timesteps = False):
         (h, w), channels = self.image_size, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
@@ -837,7 +1009,7 @@ class GaussianDiffusion(Module):
         assert h == img_size[0] and w == img_size[1], f'height and width of image must be {img_size}'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
-        img = self.normalize(img)
+        img = self.normalize(img, mode=self.mode)
         return self.p_losses(img, t, *args, **kwargs)
 
 # dataset classes
@@ -846,23 +1018,24 @@ class Dataset(Dataset):
     def __init__(
         self,
         folder,
-        image_size,
-        exts = ['jpg', 'jpeg', 'png', 'tiff'],
-        augment_horizontal_flip = False,
-        convert_image_to = None
+        mode='all'
+        # image_size,
+        # exts = ['jpg', 'jpeg', 'png', 'tiff'],
+        # augment_horizontal_flip = False,
+        # convert_image_to = None
     ):
         super().__init__()
         self.folder = folder
-        self.image_size = image_size
-        self.paths = [p for ext in exts for p in Path(f'{folder}').glob(f'**/*.{ext}')]
+        self.paths = glob.glob(self.folder+'/data*.npy')
+        self.mode = mode
 
-        maybe_convert_fn = partial(convert_image_to_fn, convert_image_to) if exists(convert_image_to) else nn.Identity()
+        # maybe_convert_fn = partial(convert_image_to_fn, convert_image_to) if exists(convert_image_to) else nn.Identity()
 
         self.transform = T.Compose([
-            T.Lambda(maybe_convert_fn),
-            T.Resize(image_size),
-            T.RandomHorizontalFlip() if augment_horizontal_flip else nn.Identity(),
-            T.CenterCrop(image_size),
+            # T.Lambda(maybe_convert_fn),
+            # T.Resize(image_size),
+            # T.RandomHorizontalFlip() if augment_horizontal_flip else nn.Identity(),
+            # T.CenterCrop(image_size),
             T.ToTensor()
         ])
 
@@ -871,8 +1044,19 @@ class Dataset(Dataset):
 
     def __getitem__(self, index):
         path = self.paths[index]
-        img = Image.open(path)
-        return self.transform(img)
+
+        data = np.load(path, allow_pickle=True).item()
+        if self.mode == 'all':
+            params = np.stack([data['int'], data['vel'], data['width']])
+        elif self.mode == 'int':
+            params = data['int'][None,:]
+        elif self.mode == 'vel':
+            params = data['vel'][None,:]
+        elif self.mode == 'width':
+            params = data['width'][None,:]
+
+        params = torch.tensor(params, dtype=torch.float32)
+        return params
 
 # trainer class
 
@@ -882,9 +1066,9 @@ class Trainer:
         diffusion_model,
         folder,
         *,
+        mode = 'all',
         train_batch_size = 16,
         gradient_accumulate_every = 1,
-        augment_horizontal_flip = True,
         train_lr = 1e-4,
         train_num_steps = 100000,
         ema_update_every = 10,
@@ -892,7 +1076,7 @@ class Trainer:
         adam_betas = (0.9, 0.99),
         save_and_sample_every = 1000,
         num_samples = 25,
-        results_folder = './results',
+        results_folder = './results2',
         amp = False,
         mixed_precision_type = 'fp16',
         split_batches = True,
@@ -907,6 +1091,7 @@ class Trainer:
 
         # accelerator
 
+        self.mode = mode
         self.accelerator = Accelerator(
             split_batches = split_batches,
             mixed_precision = mixed_precision_type if amp else 'no'
@@ -920,8 +1105,8 @@ class Trainer:
 
         # default convert_image_to depending on channels
 
-        if not exists(convert_image_to):
-            convert_image_to = {1: 'L', 3: 'RGB', 4: 'RGBA'}.get(self.channels)
+        # if not exists(convert_image_to):
+        #     convert_image_to = {1: 'L', 3: 'RGB', 4: 'RGBA'}.get(self.channels)
 
         # sampling and training hyperparameters
 
@@ -940,7 +1125,8 @@ class Trainer:
 
         # dataset and dataloader
 
-        self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
+        # self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
+        self.ds = Dataset(folder, self.mode)
 
         assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
 

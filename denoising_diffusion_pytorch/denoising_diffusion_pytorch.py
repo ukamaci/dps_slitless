@@ -754,8 +754,8 @@ class GaussianDiffusion(Module):
     def grad_and_value(self, x_prev, x_0_hat, measurement):
         x_0_hat = self.unnormalize(x_0_hat, mode=self.mode) # unnormalize x_0_hat before fwd_op
         difference = measurement - self.forward_op(x_0_hat, device=self.device)
-        # norm = torch.sqrt(torch.sum(difference**2, dim=(1,2,3))).sum()
-        norm = torch.sum(difference**2, dim=(1,2,3)).sum()
+        norm = torch.sqrt(torch.sum(difference**2, dim=(1,2,3))).sum()
+        # norm = torch.sum(difference**2, dim=(1,2,3)).sum()
         norm_grad = torch.autograd.grad(outputs=norm, inputs=x_prev)[0]
         return norm_grad, norm
 

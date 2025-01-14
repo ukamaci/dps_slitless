@@ -84,6 +84,7 @@ def convert_image_to_fn(img_type, image):
 # normalization functions
 
 def normalize_to_neg_one_to_one(img, mode='all'):
+    # If x==
     if mode=='all':
         img[:,0] = img[:,0] * 2 - 1
         img[:,1] = img[:,1] / 2
@@ -95,6 +96,8 @@ def normalize_to_neg_one_to_one(img, mode='all'):
     elif mode=='width':
         img = 2*(img-0.98765432)/1.3 - 1
     return img
+# elif x==
+####
 
 def unnormalize_to_zero_to_one(img, mode='all'):
     if mode=='all':
@@ -1085,7 +1088,7 @@ class Trainer:
         inception_block_idx = 2048,
         max_grad_norm = 1.,
         num_fid_samples = 50000,
-        save_best_and_latest_only = False
+        save_best_and_latest_only = False  # "False" == "Save All"
     ):
         super().__init__()
 
@@ -1186,7 +1189,7 @@ class Trainer:
             self.best_fid = 1e10 # infinite
 
         self.save_best_and_latest_only = save_best_and_latest_only
-
+    
     @property
     def device(self):
         return self.accelerator.device
@@ -1231,6 +1234,7 @@ class Trainer:
         device = accelerator.device
 
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
+            train_total_loss_tracker = []
 
             while self.step < self.train_num_steps:
                 self.model.train()
@@ -1247,6 +1251,7 @@ class Trainer:
 
                     self.accelerator.backward(loss)
 
+                train_total_loss_tracker.append(total_loss)
                 pbar.set_description(f'loss: {total_loss:.4f}')
 
                 accelerator.wait_for_everyone()
@@ -1288,5 +1293,13 @@ class Trainer:
                             self.save(milestone)
 
                 pbar.update(1)
+
+        train_fig, train_ax = plt.subplots()
+        train_ax.plot(np.arange(len(train_total_loss_tracker)), train_total_loss_tracker, label='total_loss')
+        train_ax.set_xlabel('Milestones')
+        train_ax.set_ylabel('Total Loss Values')
+        train_ax.set_title('Training Total Loss vs. Milestone Plots')
+        train_ax.legend()
+        train_fig.savefig(str(self.results_folder / 'train_total_loss_plot.png'))
 
         accelerator.print('training complete')

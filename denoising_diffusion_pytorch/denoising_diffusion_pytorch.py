@@ -1,4 +1,4 @@
-import math, glob
+import math, glob, json, subprocess
 from slitless.forward import Source
 import matplotlib.pyplot as plt
 import numpy as np
@@ -8,6 +8,8 @@ from random import random
 from functools import partial
 from collections import namedtuple
 from multiprocessing import cpu_count
+from datetime import datetime
+from denoising_diffusion_pytorch.plotting import plotgrid
 
 import torch
 from torch import nn, einsum
@@ -86,9 +88,9 @@ def convert_image_to_fn(img_type, image):
 def normalize_to_neg_one_to_one(img, mode='all'):
     # If x==
     if mode=='all':
-        img[:,0] = img[:,0] * 2 - 1
-        img[:,1] = img[:,1] / 2
-        img[:,2] = 2*(img[:,2]-0.98765432)/1.3 - 1
+        img[...,0,:,:] = img[...,0,:,:] * 2 - 1
+        img[...,1,:,:] = img[...,1,:,:] / 2
+        img[...,2,:,:] = 2*(img[...,2,:,:]-0.98765432)/1.3 - 1
     elif mode=='int':
         img = img * 2 - 1
     elif mode=='vel':
@@ -101,9 +103,9 @@ def normalize_to_neg_one_to_one(img, mode='all'):
 
 def unnormalize_to_zero_to_one(img, mode='all'):
     if mode=='all':
-        img[:,0] = (img[:,0] + 1) / 2
-        img[:,1] = img[:,1] * 2
-        img[:,2] = (img[:,2] + 1) / 2 * 1.3 + 0.98765432
+        img[...,0,:,:] = (img[...,0,:,:] + 1) / 2
+        img[...,1,:,:] = img[...,1,:,:] * 2
+        img[...,2,:,:] = (img[...,2,:,:] + 1) / 2 * 1.3 + 0.98765432
     elif mode=='int':
         img = (img + 1) / 2
     elif mode=='vel':
@@ -762,38 +764,6 @@ class GaussianDiffusion(Module):
         norm_grad = torch.autograd.grad(outputs=norm, inputs=x_prev)[0]
         return norm_grad, norm
 
-    def p_sample_loop_2(self, shape, return_all_timesteps = False):
-        batch, device = shape[0], self.device
-
-        img = torch.randn(shape, device = device, requires_grad = True)
-        pred_img, x_start = self.p_sample(img, self.num_timesteps)
-        img[:,0] = self.normalize(self.pred_int, mode='int')
-
-        x_start = None
-        norms = []
-        grad_norms = []
-        rmses = []
-
-        for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
-            img = img.requires_grad_()
-            pred_img, x_start = self.p_sample(img, t, self_cond)
-            norm_grad, norm = self.grad_and_value(
-                x_prev=img, 
-                x_0_hat=x_start, 
-                measurement=self.measurement
-            )
-            img = pred_img - norm_grad * self.grad_scale [None,:,None,None]
-            img = img.detach_()
-            pred_img = pred_img.detach_()
-            x_start = x_start.detach_()
-
-            rmses.append(torch.sqrt(torch.mean((self.unnormalize(img.detach().clone(), mode=self.mode) - self.true)**2, dim=(-1,-2))).cpu().numpy())
-            norms.append(norm.detach().cpu().numpy())
-            grad_norms.append(torch.linalg.norm(norm_grad.detach()).cpu().numpy())
-
-        img = self.unnormalize(img, mode=self.mode)
-        return img, norms, grad_norms, rmses
-
     # @torch.inference_mode()
     def p_sample_loop(self, shape, return_all_timesteps = False):
         batch, device = shape[0], self.device
@@ -802,7 +772,7 @@ class GaussianDiffusion(Module):
             img = torch.randn(shape, device = device, requires_grad = True)
         else:
             img = torch.randn(shape, device = device, requires_grad = False)
-        # imgs = [img.clone()]
+        imgs = [img.clone()]
 
         # Source(param3d=self.unnormalize(img.detach().cpu().numpy())[0], pix=True).plot('Recon - INIT')
         # plt.pause(0.1)
@@ -835,10 +805,10 @@ class GaussianDiffusion(Module):
             else:
                 img, x_start = self.p_sample(img, t, self_cond)
 
-            # imgs.append(img)
+            imgs.append(img)
 
-        # ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
-        ret = img
+        ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
+        # ret = img
 
         ret = self.unnormalize(ret, mode=self.mode)
         if self.recon:
@@ -1017,7 +987,7 @@ class GaussianDiffusion(Module):
 
 # dataset classes
 
-class Dataset(Dataset):
+class EISDataset(Dataset):
     def __init__(
         self,
         folder,
@@ -1113,7 +1083,6 @@ class Trainer:
 
         # sampling and training hyperparameters
 
-        assert has_int_squareroot(num_samples), 'number of samples must have an integer square root'
         self.num_samples = num_samples
         self.save_and_sample_every = save_and_sample_every
 
@@ -1129,7 +1098,7 @@ class Trainer:
         # dataset and dataloader
 
         # self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
-        self.ds = Dataset(folder, self.mode)
+        self.ds = EISDataset(folder, self.mode)
 
         assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
 
@@ -1150,6 +1119,8 @@ class Trainer:
 
         self.results_folder = Path(results_folder)
         self.results_folder.mkdir(exist_ok = True)
+        self.periodic_samples_folder = self.results_folder / 'periodic_samples'
+        self.periodic_samples_folder.mkdir(exist_ok = True)
 
         # step counter state
 
@@ -1193,6 +1164,23 @@ class Trainer:
     @property
     def device(self):
         return self.accelerator.device
+
+    def save_config(self, config: dict):
+        if not self.accelerator.is_local_main_process:
+            return
+        try:
+            git_commit = subprocess.check_output(
+                ['git', 'rev-parse', '--short', 'HEAD'], stderr=subprocess.DEVNULL
+            ).decode().strip()
+        except Exception:
+            git_commit = 'unknown'
+        config_out = {
+            'timestamp': datetime.now().isoformat(timespec='seconds'),
+            'git_commit': git_commit,
+            **config,
+        }
+        with open(self.results_folder / 'config.json', 'w') as f:
+            json.dump(config_out, f, indent=2)
 
     def save(self, milestone):
         if not self.accelerator.is_local_main_process:
@@ -1276,7 +1264,10 @@ class Trainer:
 
                         all_images = torch.cat(all_images_list, dim = 0)
 
-                        utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow = int(math.sqrt(self.num_samples)))
+
+                        fig, ax = plotgrid(all_images, mode=self.mode)
+                        fig.savefig(str(self.periodic_samples_folder / f'sample-{milestone}.png'))
+                        # utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow = int(math.sqrt(self.num_samples)))
 
                         # whether to calculate fid
 
@@ -1294,12 +1285,13 @@ class Trainer:
 
                 pbar.update(1)
 
+        np.save(str(self.results_folder / 'train_loss.npy'), np.array(train_total_loss_tracker))
+
         train_fig, train_ax = plt.subplots()
         train_ax.plot(np.arange(len(train_total_loss_tracker)), train_total_loss_tracker, label='total_loss')
-        train_ax.set_xlabel('Milestones')
-        train_ax.set_ylabel('Total Loss Values')
-        train_ax.set_title('Training Total Loss vs. Milestone Plots')
+        train_ax.set_xlabel('Step')
+        train_ax.set_ylabel('Loss')
+        train_ax.set_title('Training loss')
         train_ax.legend()
         train_fig.savefig(str(self.results_folder / 'train_total_loss_plot.png'))
-
         accelerator.print('training complete')

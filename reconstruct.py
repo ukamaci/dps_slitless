@@ -10,7 +10,7 @@ import numpy as np
 path_data = '/home/kamo/resources/slitless/data/datasets/baseline/'
 data = 'eis_train_5_64x64.npy' # 5 of 64x64 EIS dataset train images
 # data = 'eis_5_64x64.npy' # 5 of 64x64 EIS dataset train images
-rec_mode = 'vel'
+rec_mode = 'all'
 suffix = '' if rec_mode=='all' else '_{}'.format(rec_mode)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # device = torch.device('cpu')
@@ -19,14 +19,14 @@ param4dar = np.load(path_data+data)
 
 M = param4dar.shape[-1]
 numdetectors = 3
-dbsnr = 100
-noise_model='poisson'
-# noise_model='gaussian'
-num_samples = 5
+dbsnr = 50
+# noise_model='poisson'
+noise_model='gaussian'
+num_samples = 10
 
 Sr = Source(
     # param3d=torch.tensor(param4dar),
-    param3d=torch.tensor(param4dar[[0]]).to(device),
+    param3d=torch.tensor(param4dar[[1]]).to(device),
     pix=True
 )
 # mask= np.ones_like(Sr.param3d)
@@ -74,7 +74,7 @@ model = Unet(
     flash_attn = True
 ).to(device)
 
-data = torch.load('/home/kamo/resources/denoising-diffusion-pytorch/results{}/model-6.pt'.format(suffix), map_location=device, weights_only=True)
+data = torch.load('/home/kamo/resources/denoising-diffusion-pytorch/results{}/model-10.pt'.format(suffix), map_location=device, weights_only=True)
 
 adapted_dict = {k[6:]: v for k, v in data['model'].items() if k.startswith('model.')}
 
@@ -150,6 +150,102 @@ if rec_mode == 'all':
         for i in range(num_samples):
             Source(param3d=samples[i], pix=True).plot('Recon {}'.format(i+1))
         Source(param3d=samples.mean(axis=0), pix=True).plot('Recon Mean')
+        Source(param3d=samples.std(axis=0), pix=True).plot('Recon Mean')
+
+
+    recs = [meas[0], true[0], samples[0], samples[1], samples[2], samples.mean(axis=0)] 
+    titles = ['Meas', 'True', 'Sample 1', 'Sample 2', 'Sample 3', 'Posterior Mean']
+
+    vmin_row0 = recs[1][0].min()
+    vmax_row0 = recs[1][0].max()
+    vmin_row1 = recs[1][1].min()
+    vmax_row1 = recs[1][1].max()
+    vmin_row2 = recs[1][2].min()
+    vmax_row2 = recs[1][2].max()
+
+    fig, ax = plt.subplots(3, 6, figsize=(15, 7), gridspec_kw={"width_ratios": [1, 1, 1, 1, 1, 1]})
+    # First row
+    im = ax[0, 0].imshow(recs[0][0], cmap='hot', vmin=vmin_row0, vmax=vmax_row0)
+    ax[0, 0].axes.get_xaxis().set_visible(False)
+    ax[0, 0].axes.get_yaxis().set_visible(False)
+    # ax[0, i].set_title(titles[i])
+
+    # Second row
+    im = ax[1, 0].imshow(recs[0][1], cmap='hot', vmin=vmin_row0, vmax=vmax_row0)
+    ax[1, 0].axes.get_xaxis().set_visible(False)
+    ax[1, 0].axes.get_yaxis().set_visible(False)
+
+    # Third row
+    im = ax[2, 0].imshow(recs[0][2], cmap='hot', vmin=vmin_row0, vmax=vmax_row0)
+    ax[2, 0].axes.get_xaxis().set_visible(False)
+    ax[2, 0].axes.get_yaxis().set_visible(False)
+
+    for i in np.arange(1,6):
+        # First row
+        im = ax[0, i].imshow(recs[i][0], cmap='hot', vmin=vmin_row0, vmax=vmax_row0)
+        ax[0, i].axes.get_xaxis().set_visible(False)
+        ax[0, i].axes.get_yaxis().set_visible(False)
+        # ax[0, i].set_title(titles[i])
+
+        # Second row
+        im = ax[1, i].imshow(recs[i][1], cmap='seismic', vmin=vmin_row1, vmax=vmax_row1)
+        ax[1, i].axes.get_xaxis().set_visible(False)
+        ax[1, i].axes.get_yaxis().set_visible(False)
+
+        # Third row
+        im = ax[2, i].imshow(recs[i][2], cmap='plasma', vmin=vmin_row2, vmax=vmax_row2)
+        ax[2, i].axes.get_xaxis().set_visible(False)
+        ax[2, i].axes.get_yaxis().set_visible(False)
+
+    # Add colorbars
+    cbar_ax1 = fig.add_axes([0.895, 0.713, 0.01, 0.267])  # Adjust the position and size
+    cbar_ax2 = fig.add_axes([0.895, 0.368, 0.01, 0.267])
+    cbar_ax3 = fig.add_axes([0.895, 0.020, 0.01, 0.267])
+
+    fig.colorbar(ax[0, 1].images[0], cax=cbar_ax1, orientation='vertical')
+    fig.colorbar(ax[1, 1].images[0], cax=cbar_ax2, orientation='vertical')
+    fig.colorbar(ax[2, 1].images[0], cax=cbar_ax3, orientation='vertical')
+
+    plt.tight_layout(h_pad=4, rect=[0, 0, 0.9, 1])  # Leave space for colorbars
+    plt.show()
+
+    # recs = [true[0], samples[0], samples.mean(axis=0), samples.std(axis=0), abs(samples.mean(axis=0)-true[0])] 
+    # titles = ['True', 'Point Est', 'MMSE', 'STD', 'Error']
+
+    # vmin_row0 = recs[0][0].min()
+    # vmax_row0 = recs[0][0].max()
+    # vmin_row1 = recs[0][1].min()
+    # vmax_row1 = recs[0][1].max()
+    # vmin_row2 = recs[0][2].min()
+    # vmax_row2 = recs[0][2].max()
+
+    # fig, ax = plt.subplots(3, 5, figsize=(11, 7), gridspec_kw={"width_ratios": [1, 1, 1, 1, 1]})
+
+    # for i in range(5):
+    #     # First row
+    #     im = ax[0, i].imshow(
+    #         recs[i][0], cmap='hot', vmin=vmin_row0 if i < 3 else None, vmax=vmax_row0 if i < 3 else None
+    #     )
+    #     ax[0, i].axes.get_xaxis().set_visible(False)
+    #     ax[0, i].axes.get_yaxis().set_visible(False)
+    #     ax[0, i].set_title(titles[i])
+
+    #     # Second row
+    #     im = ax[1, i].imshow(
+    #         recs[i][1], cmap='seismic', vmin=vmin_row1 if i < 3 else None, vmax=vmax_row1 if i < 3 else None
+    #     )
+    #     ax[1, i].axes.get_xaxis().set_visible(False)
+    #     ax[1, i].axes.get_yaxis().set_visible(False)
+
+    #     # Third row
+    #     im = ax[2, i].imshow(
+    #         recs[i][2], cmap='plasma', vmin=vmin_row2 if i < 3 else None, vmax=vmax_row2 if i < 3 else None
+    #     )
+    #     ax[2, i].axes.get_xaxis().set_visible(False)
+    #     ax[2, i].axes.get_yaxis().set_visible(False)
+
+    # plt.tight_layout(rect=[0, 0, 0.9, 1])  # Adjust layout for colorbars
+    # plt.show()
 
 else:
     if rec_mode == 'int':

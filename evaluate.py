@@ -53,7 +53,6 @@ samples = []
 modellist = [10,40,70]
 num_samples = 100
 
-# fid_scores = []
 means_ddpm = []
 stds_ddpm = []
 
@@ -163,5 +162,5 @@ plt.figure()
 plt.plot(modellist, gaussmatch_scores, '-o')
 plt.legend(['int','vel','width'])
 plt.grid(which='both', axis='both')
-plt.title('Stds Width')
+plt.title('Gaussmatch Score vs Checkpoint')
 plt.show()

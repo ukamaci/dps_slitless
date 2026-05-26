@@ -1,5 +1,7 @@
 # Generation results
 results/
+training_results/
+model_samples/
 *.png
 *.pt
 
@@ -7,10 +9,11 @@ results/
 __pycache__/
 *.py[cod]
 *$py.class
-
+*pdf
 # C extensions
 *.so
-
+*code-workspace
+.vscode/*
 # Distribution / packaging
 .Python
 build/
@@ -31,7 +34,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
-
+*.md
 # PyInstaller
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.

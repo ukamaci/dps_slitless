@@ -74,7 +74,7 @@ model = Unet(
     flash_attn = True
 ).to(device)
 
-data = torch.load('/home/kamo/resources/denoising-diffusion-pytorch/results{}/model-10.pt'.format(suffix), map_location=device, weights_only=True)
+data = torch.load('/home/kamo/resources/denoising-diffusion-pytorch/training_results/results{}/model-10.pt'.format(suffix), map_location=device, weights_only=True)
 
 adapted_dict = {k[6:]: v for k, v in data['model'].items() if k.startswith('model.')}
 
@@ -153,7 +153,7 @@ if rec_mode == 'all':
         Source(param3d=samples.std(axis=0), pix=True).plot('Recon Mean')
 
 
-    recs = [meas[0], true[0], samples[0], samples[1], samples[2], samples.mean(axis=0)] 
+    recs = [meas[0].cpu().numpy(), true[0], samples[0], samples[1], samples[2], samples.mean(axis=0)]
     titles = ['Meas', 'True', 'Sample 1', 'Sample 2', 'Sample 3', 'Posterior Mean']
 
     vmin_row0 = recs[1][0].min()

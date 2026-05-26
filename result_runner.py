@@ -59,7 +59,7 @@ modellist = [1,5,10,20,30,40,50,60,70]
 modellist = np.concatenate((np.array([1]), np.linspace(5,70,14).astype(int)))
 rmses_list = []
 for modelnum in modellist:
-    data = torch.load('/home/kamo/resources/denoising-diffusion-pytorch/results/model-{}.pt'.format(modelnum), map_location=device, weights_only=True)
+    data = torch.load('/home/kamo/resources/denoising-diffusion-pytorch/training_results/results/model-{}.pt'.format(modelnum), map_location=device, weights_only=True)
 
     adapted_dict = {k[6:]: v for k, v in data['model'].items() if k.startswith('model.')}
 

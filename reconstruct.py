@@ -1,305 +1,179 @@
+import json, glob
 import torch
-from denoising_diffusion_pytorch import Unet, GaussianDiffusion, Trainer
-import matplotlib.pyplot as plt
-from slitless.data_loader import BasicDataset
-from torch.utils.data import DataLoader
-from slitless.forward import Source, Imager, forward_op_torch
 import numpy as np
-# torch.manual_seed(0)
+import matplotlib.pyplot as plt
+from denoising_diffusion_pytorch import Unet, GaussianDiffusion
+from denoising_diffusion_pytorch.normalization import make_normalization
+from slitless.forward import forward_op_torch
 
-path_data = '/home/kamo/resources/slitless/data/datasets/baseline/'
-data = 'eis_train_5_64x64.npy' # 5 of 64x64 EIS dataset train images
-# data = 'eis_5_64x64.npy' # 5 of 64x64 EIS dataset train images
-rec_mode = 'all'
-suffix = '' if rec_mode=='all' else '_{}'.format(rec_mode)
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-# device = torch.device('cpu')
+SPEEDOFLIGHT = 299792.458
+WAVELENGTH   = 195.117937907451
 
-param4dar = np.load(path_data+data)
-
-M = param4dar.shape[-1]
+# ── config ────────────────────────────────────────────────────────────────────
+run_folder  = './training_results/results'   # training run to load
+milestone   = 10                             # model-{milestone}.pt
+rec_mode    = 'all'
+sample_idx  = 0                              # which dset_v6 test sample to reconstruct
 numdetectors = 3
-dbsnr = 50
-# noise_model='poisson'
-noise_model='gaussian'
-num_samples = 10
+num_samples  = 10
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-Sr = Source(
-    # param3d=torch.tensor(param4dar),
-    param3d=torch.tensor(param4dar[[1]]).to(device),
-    pix=True
-)
-# mask= np.ones_like(Sr.param3d)
+DATA_DIR = '/home/kamo/resources/slitless/data/eis_data/datasets/dset_v6/data/test'
 
-# imager = Imager(pixelated=True, mask=mask, dbsnr=dbsnr, max_count=dbsnr**2/0.9,
-imager = Imager(pixelated=True, dbsnr=dbsnr, max_count=dbsnr**2/0.9,
-noise_model=noise_model, spectral_orders=[0,-1,1,-2,2][:numdetectors])
+# ── load normalization from run config ────────────────────────────────────────
+config_path = f'{run_folder}/config.json'
+try:
+    with open(config_path) as f:
+        run_config = json.load(f)
+    norm_mode = run_config.get('norm_mode', 'global_logz')
+    rec_mode  = run_config.get('mode', rec_mode)
+except FileNotFoundError:
+    norm_mode = 'global_logz'   # default for runs pre-dating config.json
 
-imager.srpix = Sr
-meas = imager.get_measurements()
+normalization = make_normalization(norm_mode, rec_mode=rec_mode)
 
-# %% DDPM Sampling
-# torch.manual_seed(0)
+# ── load test data (physical units) ───────────────────────────────────────────
+test_files = sorted(glob.glob(DATA_DIR + '/data*.npy'))
+d = np.load(test_files[sample_idx], allow_pickle=True).item()
+
+orders = [0, -1, 1, -2, 2][:numdetectors]
+meas_np = np.stack([d[f'meas_{o}'] for o in orders])[None].astype(np.float32)  # (1,K,H,W)
+
 if rec_mode == 'int':
-    meas = meas[:,[0]]
-    channels = 1
-    true = Sr.param3d[:,[0]]
+    channels  = 1
+    true_np   = d['int'][None, None].astype(np.float32)     # (1,1,H,W)
+    meas_np   = meas_np[:, [0]]                              # zeroth-order only
 elif rec_mode == 'vel':
-    channels = 1
-    true = Sr.param3d[:,[1]]
+    channels  = 1
+    true_np   = d['vel'][None, None].astype(np.float32)
 else:
-    channels = 3
-    # true = torch.tensor(param4dar[[0]])
-    true = Sr.param3d
+    channels  = 3
+    true_np   = np.stack([d['int'], d['vel'], d['width']])[None].astype(np.float32)  # (1,3,H,W)
 
+meas = torch.tensor(meas_np).to(device)
+true = torch.tensor(true_np).to(device)
 
-# Load the pretrained model
+# for per-sample normalization, estimate intensity scale from zeroth-order measurement
+if norm_mode == 'persample_linear':
+    normalization.set_infer_scale(meas[:, 0].max())
 
+# ── forward operator (physical units → measurements) ─────────────────────────
 def forward_op(x, device=None):
     if rec_mode == 'int':
         return torch.nn.Identity()(x)
     elif rec_mode == 'vel':
-        return forward_op_torch(
-            true_intensity=Sr.param3d[:,0].repeat(x.shape[0],1,1), 
-            true_doppler=x[:,0], 
-            true_linewidth=Sr.param3d[:,2].repeat(x.shape[0],1,1), 
-            device=device)
+        int_fixed = true[:, 0].repeat(x.shape[0], 1, 1)
+        wid_fixed = true[:, 2].repeat(x.shape[0], 1, 1)
+        return forward_op_torch(true_intensity=int_fixed, true_doppler=x[:, 0],
+                                true_linewidth=wid_fixed, device=device)
     else:
-        return forward_op_torch(true_intensity=x[:,0], true_doppler=x[:,1], true_linewidth=x[:,2], device=device)
+        return forward_op_torch(true_intensity=x[:, 0], true_doppler=x[:, 1],
+                                true_linewidth=x[:, 2], device=device)
 
+# ── model ─────────────────────────────────────────────────────────────────────
 model = Unet(
     channels=channels,
-    dim = 64,
-    dim_mults = (1, 2, 4, 8),
-    flash_attn = True
+    dim=64,
+    dim_mults=(1, 2, 4, 8),
+    flash_attn=True
 ).to(device)
 
-data = torch.load('/home/kamo/resources/denoising-diffusion-pytorch/training_results/results{}/model-10.pt'.format(suffix), map_location=device, weights_only=True)
-
-adapted_dict = {k[6:]: v for k, v in data['model'].items() if k.startswith('model.')}
-
-model.load_state_dict(adapted_dict)
-
-# model.load_state_dict(torch.load('./results/model-25.pt', weights_only=True))
+ckpt = torch.load(f'{run_folder}/model-{milestone}.pt', map_location=device, weights_only=True)
+adapted = {k[6:]: v for k, v in ckpt['model'].items() if k.startswith('model.')}
+model.load_state_dict(adapted)
 model.eval()
 
-# Initialize the diffusion process
+# ── diffusion + DPS ───────────────────────────────────────────────────────────
 diffusion = GaussianDiffusion(
     model,
-    image_size = 64,
-    timesteps = 1000,           # number of steps
-    sampling_timesteps = 1000,    # number of sampling timesteps (using ddim for faster inference [see citation for ddim paper])
-    recon = True,
-    measurement=torch.tensor(meas).to(device),
-    true=true.to(device),
+    mode=rec_mode,
+    image_size=64,
+    timesteps=1000,
+    sampling_timesteps=1000,
+    recon=True,
+    measurement=meas,
+    true=true,
     beta_schedule='cosine',
-    grad_scale = torch.tensor([1]).to(device),
-    # grad_scale=1*torch.tensor([1,3.5,0.1]).to(device),
-    # grad_scale=1.25*torch.tensor([1,1,1]).to(device),
+    clip_denoised=(-5., 5.),
+    grad_scale=torch.tensor([1.]).to(device),
     forward_op=forward_op,
     device=device,
-    mode=rec_mode
+    normalization=normalization,
 )
 
-# Generate new samples
 samples, norms, grad_norms, rmses = diffusion.sample(batch_size=num_samples)
-samples = samples.detach().cpu().numpy()
-true = true.detach().cpu().numpy()
-rmses = np.array(rmses).squeeze()
+samples  = samples.detach().cpu().numpy()   # (num_samples, C, H, W) — physical units
+true_np  = true.detach().cpu().numpy()
+rmses    = np.array(rmses).squeeze()
 if len(rmses.shape) == 3:
     rmses = rmses.mean(axis=1)
 
-plt.figure()
-# plt.plot(torch.tensor(norms).detach().cpu().numpy())
-plt.plot(norms)
-plt.title('Norms')
-plt.grid(which='both', axis='both')
-plt.show()
-
-plt.figure()
-# plt.plot(torch.tensor(grad_norms).detach().cpu().numpy())
-plt.plot(grad_norms)
-plt.title('Grad Norms')
-plt.grid(which='both', axis='both')
-plt.show()
-
+# ── diagnostic plots ──────────────────────────────────────────────────────────
+plt.figure(); plt.plot(norms);      plt.title('Norms');      plt.grid(); plt.show()
+plt.figure(); plt.plot(grad_norms); plt.title('Grad Norms'); plt.grid(); plt.show()
 plt.figure()
 plt.semilogy(rmses)
-plt.legend(['int','vel','width'])
-plt.title('RMSEs')
-plt.grid(which='both', axis='both')
-plt.show()
+plt.legend(['int', 'vel', 'width'] if rec_mode == 'all' else [rec_mode])
+plt.title('RMSEs'); plt.grid(); plt.show()
 
+# ── RMSE in physical units ────────────────────────────────────────────────────
 if rec_mode == 'all':
-    truth_phy = imager.frompix(true, width_unit='km/s', array=True)
-    recon_phy = imager.frompix(samples.mean(axis=0), width_unit='km/s', array=True)  
-    recon_phy2 = imager.frompix(samples, width_unit='km/s', array=True)  
-    rmse = np.sqrt(np.mean((truth_phy - recon_phy)**2, axis=(-1,-2)))
-    rmse2 = np.sqrt(np.mean((truth_phy - recon_phy2)**2, axis=(-1,-2)))
-    if true.shape[0]==1:
-        print('rmse: {}'.format(rmse))
-    print('rmse_all: {}'.format(rmse2))
-    print('rmse_all_m: {}'.format(rmse2.mean(axis=0)))
+    true_r   = true_np[0]                             # (3,H,W)
+    mean_r   = samples.mean(axis=0)                   # (3,H,W)
 
-    if true.shape[0]>1:
-        for i in range(true.shape[0]):
-            Sr.plot(idx=i, title='True {}'.format(i+1))
-            Source(param3d=samples[i], pix=True).plot('Recon {}'.format(i+1))
-    else:
-        Sr.plot('True')
-        for i in range(num_samples):
-            Source(param3d=samples[i], pix=True).plot('Recon {}'.format(i+1))
-        Source(param3d=samples.mean(axis=0), pix=True).plot('Recon Mean')
-        Source(param3d=samples.std(axis=0), pix=True).plot('Recon Mean')
+    # convert width Å → km/s for reporting
+    w_fac = SPEEDOFLIGHT / WAVELENGTH
+    def rmse_ch(a, b):
+        return np.sqrt(np.mean((a - b)**2, axis=(-1, -2)))
 
+    rmse_mean = rmse_ch(true_r, mean_r)
+    rmse_mean[2] *= w_fac
+    rmse_all  = np.stack([rmse_ch(true_r, s) for s in samples])
+    rmse_all[:, 2] *= w_fac
 
-    recs = [meas[0].cpu().numpy(), true[0], samples[0], samples[1], samples[2], samples.mean(axis=0)]
+    print(f'RMSE (posterior mean): int={rmse_mean[0]:.1f} DN, vel={rmse_mean[1]:.2f} km/s, width={rmse_mean[2]:.2f} km/s')
+    print(f'RMSE (samples mean):   int={rmse_all[:,0].mean():.1f} DN, vel={rmse_all[:,1].mean():.2f} km/s, width={rmse_all[:,2].mean():.2f} km/s')
+
+    # ── reconstruction grid ───────────────────────────────────────────────────
+    recs   = [meas[0].cpu().numpy(), true_np[0], samples[0], samples[1], samples[2], mean_r]
     titles = ['Meas', 'True', 'Sample 1', 'Sample 2', 'Sample 3', 'Posterior Mean']
 
-    vmin_row0 = recs[1][0].min()
-    vmax_row0 = recs[1][0].max()
-    vmin_row1 = recs[1][1].min()
-    vmax_row1 = recs[1][1].max()
-    vmin_row2 = recs[1][2].min()
-    vmax_row2 = recs[1][2].max()
+    vmin0, vmax0 = true_np[0, 0].min(), true_np[0, 0].max()
+    vmin1, vmax1 = true_np[0, 1].min(), true_np[0, 1].max()
+    vmin2, vmax2 = true_np[0, 2].min(), true_np[0, 2].max()
 
-    fig, ax = plt.subplots(3, 6, figsize=(15, 7), gridspec_kw={"width_ratios": [1, 1, 1, 1, 1, 1]})
-    # First row
-    im = ax[0, 0].imshow(recs[0][0], cmap='hot', vmin=vmin_row0, vmax=vmax_row0)
-    ax[0, 0].axes.get_xaxis().set_visible(False)
-    ax[0, 0].axes.get_yaxis().set_visible(False)
-    # ax[0, i].set_title(titles[i])
+    fig, ax = plt.subplots(3, 6, figsize=(15, 7))
+    cmaps = ['hot', 'seismic', 'plasma']
+    vmins = [vmin0, vmin1, vmin2]
+    vmaxs = [vmax0, vmax1, vmax2]
 
-    # Second row
-    im = ax[1, 0].imshow(recs[0][1], cmap='hot', vmin=vmin_row0, vmax=vmax_row0)
-    ax[1, 0].axes.get_xaxis().set_visible(False)
-    ax[1, 0].axes.get_yaxis().set_visible(False)
+    for col, (rec, title) in enumerate(zip(recs, titles)):
+        for row in range(3):
+            data = rec[row] if rec.shape[0] > row else rec[0]
+            ax[row, col].imshow(data, cmap=cmaps[row],
+                                vmin=vmins[row] if col > 0 else None,
+                                vmax=vmaxs[row] if col > 0 else None)
+            ax[row, col].axis('off')
+            if row == 0:
+                ax[row, col].set_title(title)
 
-    # Third row
-    im = ax[2, 0].imshow(recs[0][2], cmap='hot', vmin=vmin_row0, vmax=vmax_row0)
-    ax[2, 0].axes.get_xaxis().set_visible(False)
-    ax[2, 0].axes.get_yaxis().set_visible(False)
+    cbar_ax = [fig.add_axes([0.895, 0.713, 0.01, 0.267]),
+               fig.add_axes([0.895, 0.368, 0.01, 0.267]),
+               fig.add_axes([0.895, 0.020, 0.01, 0.267])]
+    for row in range(3):
+        fig.colorbar(ax[row, 1].images[0], cax=cbar_ax[row], orientation='vertical')
 
-    for i in np.arange(1,6):
-        # First row
-        im = ax[0, i].imshow(recs[i][0], cmap='hot', vmin=vmin_row0, vmax=vmax_row0)
-        ax[0, i].axes.get_xaxis().set_visible(False)
-        ax[0, i].axes.get_yaxis().set_visible(False)
-        # ax[0, i].set_title(titles[i])
-
-        # Second row
-        im = ax[1, i].imshow(recs[i][1], cmap='seismic', vmin=vmin_row1, vmax=vmax_row1)
-        ax[1, i].axes.get_xaxis().set_visible(False)
-        ax[1, i].axes.get_yaxis().set_visible(False)
-
-        # Third row
-        im = ax[2, i].imshow(recs[i][2], cmap='plasma', vmin=vmin_row2, vmax=vmax_row2)
-        ax[2, i].axes.get_xaxis().set_visible(False)
-        ax[2, i].axes.get_yaxis().set_visible(False)
-
-    # Add colorbars
-    cbar_ax1 = fig.add_axes([0.895, 0.713, 0.01, 0.267])  # Adjust the position and size
-    cbar_ax2 = fig.add_axes([0.895, 0.368, 0.01, 0.267])
-    cbar_ax3 = fig.add_axes([0.895, 0.020, 0.01, 0.267])
-
-    fig.colorbar(ax[0, 1].images[0], cax=cbar_ax1, orientation='vertical')
-    fig.colorbar(ax[1, 1].images[0], cax=cbar_ax2, orientation='vertical')
-    fig.colorbar(ax[2, 1].images[0], cax=cbar_ax3, orientation='vertical')
-
-    plt.tight_layout(h_pad=4, rect=[0, 0, 0.9, 1])  # Leave space for colorbars
+    plt.tight_layout(h_pad=4, rect=[0, 0, 0.9, 1])
     plt.show()
 
-    # recs = [true[0], samples[0], samples.mean(axis=0), samples.std(axis=0), abs(samples.mean(axis=0)-true[0])] 
-    # titles = ['True', 'Point Est', 'MMSE', 'STD', 'Error']
-
-    # vmin_row0 = recs[0][0].min()
-    # vmax_row0 = recs[0][0].max()
-    # vmin_row1 = recs[0][1].min()
-    # vmax_row1 = recs[0][1].max()
-    # vmin_row2 = recs[0][2].min()
-    # vmax_row2 = recs[0][2].max()
-
-    # fig, ax = plt.subplots(3, 5, figsize=(11, 7), gridspec_kw={"width_ratios": [1, 1, 1, 1, 1]})
-
-    # for i in range(5):
-    #     # First row
-    #     im = ax[0, i].imshow(
-    #         recs[i][0], cmap='hot', vmin=vmin_row0 if i < 3 else None, vmax=vmax_row0 if i < 3 else None
-    #     )
-    #     ax[0, i].axes.get_xaxis().set_visible(False)
-    #     ax[0, i].axes.get_yaxis().set_visible(False)
-    #     ax[0, i].set_title(titles[i])
-
-    #     # Second row
-    #     im = ax[1, i].imshow(
-    #         recs[i][1], cmap='seismic', vmin=vmin_row1 if i < 3 else None, vmax=vmax_row1 if i < 3 else None
-    #     )
-    #     ax[1, i].axes.get_xaxis().set_visible(False)
-    #     ax[1, i].axes.get_yaxis().set_visible(False)
-
-    #     # Third row
-    #     im = ax[2, i].imshow(
-    #         recs[i][2], cmap='plasma', vmin=vmin_row2 if i < 3 else None, vmax=vmax_row2 if i < 3 else None
-    #     )
-    #     ax[2, i].axes.get_xaxis().set_visible(False)
-    #     ax[2, i].axes.get_yaxis().set_visible(False)
-
-    # plt.tight_layout(rect=[0, 0, 0.9, 1])  # Adjust layout for colorbars
-    # plt.show()
-
 else:
-    if rec_mode == 'int':
-        cmap='hot'
-        factor = 1
-    elif rec_mode == 'vel':
-        cmap='seismic'
-        factor = 34.2483
-    elif rec_mode == 'width':
-        cmap='plasma'
-    rmse = np.sqrt(np.mean((true - samples)**2, axis=(-1,-2)))*factor
-    rmse_meas = np.sqrt(np.mean((true - meas.cpu().numpy())**2, axis=(-1,-2)))*factor
-    rmse2 = np.sqrt(np.mean((true - samples.mean(axis=0))**2, axis=(-1,-2)))*factor
+    cmap   = {'int': 'hot', 'vel': 'seismic', 'width': 'plasma'}[rec_mode]
+    factor = SPEEDOFLIGHT / WAVELENGTH if rec_mode == 'width' else (34.2483 if rec_mode == 'vel' else 1)
+    rmse   = np.sqrt(np.mean((true_np - samples)**2, axis=(-1, -2))) * factor
+    rmse2  = np.sqrt(np.mean((true_np - samples.mean(axis=0))**2, axis=(-1, -2))) * factor
 
+    plt.figure(); plt.imshow(true_np.squeeze(), cmap=cmap); plt.title('True'); plt.colorbar(); plt.show()
+    plt.figure(); plt.imshow(samples.mean(axis=0).squeeze(), cmap=cmap); plt.title('Recon MMSE'); plt.colorbar(); plt.show()
 
-    if true.shape[0]>1:
-        for i in range(true.shape[0]):
-            plt.figure()
-            plt.imshow(true[i].squeeze(), cmap=cmap)
-            plt.title('True {}'.format(i+1))
-            plt.colorbar()
-
-            plt.figure()
-            plt.imshow(samples[i].squeeze(), cmap=cmap)
-            plt.title('Recon {}'.format(i+1))
-            plt.colorbar()
-
-        plt.figure()
-        plt.imshow(samples.mean(axis=0).squeeze(), cmap=cmap)
-        plt.title('Recon MMSE')
-        plt.colorbar()
-
-    else:
-        plt.figure()
-        plt.imshow(true.squeeze(), cmap=cmap)
-        plt.title('True')
-        plt.colorbar()
-
-        plt.figure()
-        plt.imshow(samples.mean(axis=0).squeeze(), cmap=cmap)
-        plt.title('Recon MMSE')
-        plt.colorbar()
-
-        for i in range(num_samples):
-            plt.figure()
-            plt.imshow(samples[i].squeeze(), cmap=cmap)
-            plt.title('Recon {}'.format(i+1))
-            plt.colorbar()
-
-    print('rmse: {}'.format(rmse))
-    if true.shape[0]>1:
-        print('rmse_mean: {}'.format(rmse.mean(axis=0)))
-    else:
-        print('rmse_all: {}'.format(rmse2))
-    print('rmse_meas: {}'.format(rmse_meas))
-
-# %%
+    print(f'rmse per sample: {rmse}')
+    print(f'rmse mmse: {rmse2}')

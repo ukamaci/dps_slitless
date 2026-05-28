@@ -85,49 +85,17 @@ def convert_image_to_fn(img_type, image):
 
 # normalization functions
 
-def normalize_to_neg_one_to_one(img, mode='all'):
-    # If x==
-    if mode=='all':
-        img[...,0,:,:] = img[...,0,:,:] * 2 - 1
-        img[...,1,:,:] = img[...,1,:,:] / 2
-        img[...,2,:,:] = 2*(img[...,2,:,:]-0.98765432)/1.3 - 1
-    elif mode=='int':
-        img = img * 2 - 1
-    elif mode=='vel':
-        img = img / 2
-    elif mode=='width':
-        img = 2*(img-0.98765432)/1.3 - 1
-    return img
-# elif x==
-####
+from denoising_diffusion_pytorch.normalization import GlobalLogzNorm
 
-def unnormalize_to_zero_to_one(img, mode='all'):
-    if mode=='all':
-        img[...,0,:,:] = (img[...,0,:,:] + 1) / 2
-        img[...,1,:,:] = img[...,1,:,:] * 2
-        img[...,2,:,:] = (img[...,2,:,:] + 1) / 2 * 1.3 + 0.98765432
-    elif mode=='int':
-        img = (img + 1) / 2
-    elif mode=='vel':
-        img = img * 2
-    elif mode=='width':
-        img = (img + 1) / 2 * 1.3 + 0.98765432
-    return img
+# Simple linear [−1,1] ↔ [0,1] helpers kept for upstream modules (learned_gaussian_diffusion).
+# Not used for EIS data — EIS normalization lives in normalization.py.
+def normalize_to_neg_one_to_one(img):
+    return img * 2 - 1
 
-# def normalize_to_neg_one_to_one(img, mode='all'):
-#     if mode=='all':
-#         img[:,0] = img[:,0] * 2 - 1
-#         img[:,1] = img[:,1] * 2
-#         img[:,2] = 2*(img[:,2]-1)/0.8 - 1
-#     elif mode=='int':
-#         img = img * 2 - 1
-#     elif mode=='vel':
-#         img = img * 2
-#     elif mode=='width':
-#         img = 2*(img-1)/0.8 - 1
-#     return img
+def unnormalize_to_zero_to_one(img):
+    return (img + 1) / 2
 
-# def unnormalize_to_zero_to_one(img, mode='all'):
+# def unnormalize_to_zero_to_one(img, mode='all'):  # legacy — kept for reference only
 #     if mode=='all':
 #         img[:,0] = (img[:,0] + 1) / 2
 #         img[:,1] = img[:,1] / 2
@@ -547,7 +515,8 @@ class GaussianDiffusion(Module):
         beta_schedule = 'cosine',
         schedule_fn_kwargs = dict(),
         ddim_sampling_eta = 0.,
-        auto_normalize = True,
+        clip_denoised = True,
+        normalization = None,
         offset_noise_strength = 0.,  # https://www.crosslabs.org/blog/diffusion-with-offset-noise
         min_snr_loss_weight = False, # https://arxiv.org/abs/2303.09556
         min_snr_gamma = 5,
@@ -664,10 +633,13 @@ class GaussianDiffusion(Module):
         elif objective == 'pred_v':
             register_buffer('loss_weight', maybe_clipped_snr / (snr + 1))
 
-        # auto-normalization of data [0, 1] -> [-1, 1] - can turn off by setting it to be False
+        self.clip_denoised = clip_denoised
 
-        self.normalize = normalize_to_neg_one_to_one if auto_normalize else identity
-        self.unnormalize = unnormalize_to_zero_to_one if auto_normalize else identity
+        if normalization is None:
+            normalization = GlobalLogzNorm(rec_mode=mode)
+        self.normalization = normalization
+        self.normalize = normalization.forward
+        self.unnormalize = normalization.inverse
         if recon:
             self.measurement = self.measurement.to(self.device)
 
@@ -708,9 +680,17 @@ class GaussianDiffusion(Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
+    def _clip(self, x):
+        """Clip x_start predictions. self.clip_denoised can be False (no clip)
+        or a (min, max) tuple. True is treated as (-1., 1.) for backward compat."""
+        if self.clip_denoised is False:
+            return x
+        lo, hi = (-1., 1.) if self.clip_denoised is True else self.clip_denoised
+        return x.clamp(lo, hi)
+
     def model_predictions(self, x, t, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False):
         model_output = self.model(x, t, x_self_cond)
-        maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
+        maybe_clip = self._clip if clip_x_start else identity
 
         if self.objective == 'pred_noise':
             pred_noise = model_output
@@ -738,7 +718,7 @@ class GaussianDiffusion(Module):
         x_start = preds.pred_x_start
 
         if clip_denoised:
-            x_start.clamp_(-1., 1.)
+            x_start = self._clip(x_start)
 
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start = x_start, x_t = x, t = t)
         return model_mean, posterior_variance, posterior_log_variance, x_start
@@ -749,7 +729,7 @@ class GaussianDiffusion(Module):
         batched_times = torch.full((b,), t, device = device, dtype = torch.long)
         if not self.recon:
             with torch.no_grad():
-                model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = True)
+                model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = self.clip_denoised)
         else:
             model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = True)
         noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
@@ -757,7 +737,7 @@ class GaussianDiffusion(Module):
         return pred_img, x_start
 
     def grad_and_value(self, x_prev, x_0_hat, measurement):
-        x_0_hat = self.unnormalize(x_0_hat, mode=self.mode) # unnormalize x_0_hat before fwd_op
+        x_0_hat = self.unnormalize(x_0_hat)
         difference = measurement - self.forward_op(x_0_hat, device=self.device)
         norm = torch.sqrt(torch.sum(difference**2, dim=(1,2,3))).sum()
         # norm = torch.sum(difference**2, dim=(1,2,3)).sum()
@@ -799,7 +779,7 @@ class GaussianDiffusion(Module):
                 x_start = x_start.detach_()
 
                 if self.true is not None:
-                    rmses.append(torch.sqrt(torch.mean((self.unnormalize(img.detach().clone(), mode=self.mode) - self.true)**2, dim=(-1,-2))).cpu().numpy())
+                    rmses.append(torch.sqrt(torch.mean((self.unnormalize(img.detach().clone()) - self.true)**2, dim=(-1,-2))).cpu().numpy())
                 norms.append(norm.detach().cpu().numpy())
                 grad_norms.append(torch.linalg.norm(norm_grad.detach()).cpu().numpy())
             else:
@@ -810,7 +790,7 @@ class GaussianDiffusion(Module):
         ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
         # ret = img
 
-        ret = self.unnormalize(ret, mode=self.mode)
+        ret = self.unnormalize(ret)
         if self.recon:
             return ret, norms, grad_norms, rmses
         else:
@@ -840,7 +820,7 @@ class GaussianDiffusion(Module):
                 img = img.requires_grad_()
             time_cond = torch.full((batch,), time, device = device, dtype = torch.long)
             self_cond = x_start if self.self_condition else None
-            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, clip_x_start = True, rederive_pred_noise = True)
+            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, clip_x_start = self.clip_denoised, rederive_pred_noise = True)
 
             if time_next < 0:
                 img = x_start
@@ -868,7 +848,7 @@ class GaussianDiffusion(Module):
                 img = pred_img.detach_()
                 norms.append(norm.detach().cpu().numpy())
                 grad_norms.append(torch.linalg.norm(norm_grad.detach()).cpu().numpy())
-                rmses.append(torch.sqrt(torch.mean((self.unnormalize(img.detach().clone(), mode=self.mode) - self.true)**2, dim=(-1,-2))).cpu().numpy())
+                rmses.append(torch.sqrt(torch.mean((self.unnormalize(img.detach().clone()) - self.true)**2, dim=(-1,-2))).cpu().numpy())
 
             else:
                 img = x_start * alpha_next.sqrt() + \
@@ -879,7 +859,7 @@ class GaussianDiffusion(Module):
 
         ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
 
-        ret = self.unnormalize(ret, mode=self.mode)
+        ret = self.unnormalize(ret)
         if self.recon:
             return ret, norms, grad_norms, rmses
         else:
@@ -982,7 +962,7 @@ class GaussianDiffusion(Module):
         assert h == img_size[0] and w == img_size[1], f'height and width of image must be {img_size}'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
-        img = self.normalize(img, mode=self.mode)
+        img = self.normalize(img)
         return self.p_losses(img, t, *args, **kwargs)
 
 # dataset classes
@@ -1217,81 +1197,88 @@ class Trainer:
         if exists(self.accelerator.scaler) and exists(data['scaler']):
             self.accelerator.scaler.load_state_dict(data['scaler'])
 
-    def train(self):
-        accelerator = self.accelerator
-        device = accelerator.device
-
-        with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
-            train_total_loss_tracker = []
-
-            while self.step < self.train_num_steps:
-                self.model.train()
-
-                total_loss = 0.
-
-                for _ in range(self.gradient_accumulate_every):
-                    data = next(self.dl).to(device)
-
-                    with self.accelerator.autocast():
-                        loss = self.model(data)
-                        loss = loss / self.gradient_accumulate_every
-                        total_loss += loss.item()
-
-                    self.accelerator.backward(loss)
-
-                train_total_loss_tracker.append(total_loss)
-                pbar.set_description(f'loss: {total_loss:.4f}')
-
-                accelerator.wait_for_everyone()
-                accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-
-                self.opt.step()
-                self.opt.zero_grad()
-
-                accelerator.wait_for_everyone()
-
-                self.step += 1
-                if accelerator.is_main_process:
-                    self.ema.update()
-
-                    if self.step != 0 and divisible_by(self.step, self.save_and_sample_every):
-                        self.ema.ema_model.eval()
-
-                        with torch.inference_mode():
-                            milestone = self.step // self.save_and_sample_every
-                            batches = num_to_groups(self.num_samples, self.batch_size)
-                            all_images_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
-
-                        all_images = torch.cat(all_images_list, dim = 0)
-
-
-                        fig, ax = plotgrid(all_images, mode=self.mode)
-                        fig.savefig(str(self.periodic_samples_folder / f'sample-{milestone}.png'))
-                        # utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow = int(math.sqrt(self.num_samples)))
-
-                        # whether to calculate fid
-
-                        if self.calculate_fid:
-                            fid_score = self.fid_scorer.fid_score()
-                            accelerator.print(f'fid_score: {fid_score}')
-
-                        if self.save_best_and_latest_only:
-                            if self.best_fid > fid_score:
-                                self.best_fid = fid_score
-                                self.save("best")
-                            self.save("latest")
-                        else:
-                            self.save(milestone)
-
-                pbar.update(1)
-
-        np.save(str(self.results_folder / 'train_loss.npy'), np.array(train_total_loss_tracker))
-
+    def _save_training_artifacts(self, loss_tracker):
+        if not self.accelerator.is_main_process or len(loss_tracker) == 0:
+            return
+        np.save(str(self.results_folder / 'train_loss.npy'), np.array(loss_tracker))
         train_fig, train_ax = plt.subplots()
-        train_ax.plot(np.arange(len(train_total_loss_tracker)), train_total_loss_tracker, label='total_loss')
+        train_ax.plot(np.arange(len(loss_tracker)), loss_tracker, label='total_loss')
         train_ax.set_xlabel('Step')
         train_ax.set_ylabel('Loss')
         train_ax.set_title('Training loss')
         train_ax.legend()
         train_fig.savefig(str(self.results_folder / 'train_total_loss_plot.png'))
-        accelerator.print('training complete')
+        plt.close(train_fig)
+
+    def train(self):
+        accelerator = self.accelerator
+        device = accelerator.device
+
+        train_total_loss_tracker = []
+        try:
+            with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
+
+                while self.step < self.train_num_steps:
+                    self.model.train()
+
+                    total_loss = 0.
+
+                    for _ in range(self.gradient_accumulate_every):
+                        data = next(self.dl).to(device)
+
+                        with self.accelerator.autocast():
+                            loss = self.model(data)
+                            loss = loss / self.gradient_accumulate_every
+                            total_loss += loss.item()
+
+                        self.accelerator.backward(loss)
+
+                    train_total_loss_tracker.append(total_loss)
+                    pbar.set_description(f'loss: {total_loss:.4f}')
+
+                    accelerator.wait_for_everyone()
+                    accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+
+                    self.opt.step()
+                    self.opt.zero_grad()
+
+                    accelerator.wait_for_everyone()
+
+                    self.step += 1
+                    if accelerator.is_main_process:
+                        self.ema.update()
+
+                        if self.step != 0 and divisible_by(self.step, self.save_and_sample_every):
+                            self.ema.ema_model.eval()
+
+                            with torch.inference_mode():
+                                milestone = self.step // self.save_and_sample_every
+                                batches = num_to_groups(self.num_samples, self.batch_size)
+                                all_images_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
+
+                            all_images = torch.cat(all_images_list, dim = 0)
+
+                            fig, ax = plotgrid(all_images, mode=self.mode)
+                            fig.savefig(str(self.periodic_samples_folder / f'sample-{milestone}.png'))
+                            plt.close(fig)
+                            # utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow = int(math.sqrt(self.num_samples)))
+
+                            # whether to calculate fid
+
+                            if self.calculate_fid:
+                                fid_score = self.fid_scorer.fid_score()
+                                accelerator.print(f'fid_score: {fid_score}')
+
+                            if self.save_best_and_latest_only:
+                                if self.best_fid > fid_score:
+                                    self.best_fid = fid_score
+                                    self.save("best")
+                                self.save("latest")
+                            else:
+                                self.save(milestone)
+
+                    pbar.update(1)
+
+            accelerator.print('training complete')
+        finally:
+            self._save_training_artifacts(train_total_loss_tracker)

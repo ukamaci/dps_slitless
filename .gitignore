@@ -5,6 +5,14 @@ model_samples/
 *.png
 *.pt
 
+# Experiment outputs (heavy artifacts); keep scripts and docs
+experiments/**/outputs/*.npy
+experiments/**/outputs/*.pt
+
+# Track all experiment markdown and scripts
+!experiments/**/*.md
+!experiments/*.md
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

@@ -19,7 +19,7 @@ run_folder  = './training_results/run_all_lr1e-4_cosine_b32_conditional_linear' 
 # run_folder  = './training_results/exp_norm_persample_dset6_lr5e-6'   # training run to load
 milestone   = 10                             # model-{milestone}.pt
 rec_mode    = 'all'
-sample_idx  = 0                              # which dset_v6 test sample to reconstruct
+sample_idx  = 10                              # which dset_v6 test sample to reconstruct
 numdetectors = 3
 num_samples  = 10
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -115,13 +115,10 @@ if method == 'conditional':
         normalization=normalization,
     )
 
-    # sample one at a time; inference_mode prevents graph accumulation across steps
-    samples_list = []
-    for _ in range(num_samples):
-        with torch.inference_mode():
-            s = diffusion.sample(batch_size=1, cond=cond1)
-        samples_list.append(s.cpu().numpy())
-    samples = np.concatenate(samples_list, axis=0)   # (num_samples, C, H, W) — physical units
+    cond = cond1.expand(num_samples, -1, -1, -1)   # (num_samples, K, H, W)
+    with torch.inference_mode():
+        samples = diffusion.sample(batch_size=num_samples, cond=cond)
+    samples = samples.cpu().numpy()   # (num_samples, C, H, W) — physical units
 
 else:
     # ── DPS ───────────────────────────────────────────────────────────────────
@@ -194,14 +191,15 @@ if rec_mode == 'all':
     print(f'RMSE (samples mean):   int={rmse_all[:,0].mean():.1f} erg/cm²/s/sr, vel={rmse_all[:,1].mean():.2f} km/s, width={rmse_all[:,2].mean():.2f} km/s')
 
     # ── reconstruction grid ───────────────────────────────────────────────────
-    recs   = [meas[0].cpu().numpy(), true_np[0], samples[0], samples[1], samples[2], mean_r]
-    titles = ['Meas', 'True', 'Sample 1', 'Sample 2', 'Sample 3', 'Posterior Mean']
+    n_show  = min(3, len(samples))
+    recs    = [meas[0].cpu().numpy(), true_np[0]] + [samples[i] for i in range(n_show)] + [mean_r]
+    titles  = ['Meas', 'True'] + [f'Sample {i+1}' for i in range(n_show)] + ['Posterior Mean']
 
     vmin0, vmax0 = true_np[0, 0].min(), true_np[0, 0].max()
     vmin1, vmax1 = true_np[0, 1].min(), true_np[0, 1].max()
     vmin2, vmax2 = true_np[0, 2].min(), true_np[0, 2].max()
 
-    fig, ax = plt.subplots(3, 6, figsize=(15, 7))
+    fig, ax = plt.subplots(3, len(recs), figsize=(2.5 * len(recs), 7))
     cmaps = ['hot', 'seismic', 'plasma']
     vmins = [vmin0, vmin1, vmin2]
     vmaxs = [vmax0, vmax1, vmax2]

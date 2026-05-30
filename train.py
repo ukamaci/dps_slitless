@@ -4,7 +4,7 @@ from denoising_diffusion_pytorch.normalization import make_normalization
 mode = 'all'
 norm_mode = 'global_logz'
 cond_orders = None          # set to e.g. [0, -1, 1] for conditional training
-results_folder = './training_results/run_all_lr5e-6_cosine_b32'
+results_folder = './training_results/run_all_lr_1e-4_cosine_b32'
 
 model = Unet(
     dim = 64,
@@ -37,10 +37,10 @@ config = dict(
     beta_schedule = 'cosine',
     train_batch_size = 32,
     gradient_accumulate_every = 2,
-    train_lr = 5e-6,
-    train_num_steps = 100000,
+    train_lr = 1e-4,
+    train_num_steps = 50000,
     ema_decay = 0.995,
-    save_and_sample_every = 1000,
+    save_and_sample_every = 5000,
     dataset_path = '/home/kamo/resources/slitless/data/eis_data/datasets/dset_v6/data/train',
     norm_mode = norm_mode,
     clip_denoised = (-5., 5.),

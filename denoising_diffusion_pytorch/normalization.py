@@ -8,7 +8,7 @@ _STATS = np.load(
 
 INT_LOG_MEAN = float(_STATS['int_log_mean'])   # 6.8979
 INT_LOG_STD  = float(_STATS['int_log_std'])    # 0.6816
-INT_MEAN     = float(_STATS['int_mean'])       # 1227.93 DN  — fallback scale for unconditional generation
+INT_MEAN     = float(_STATS['int_mean'])       # 1227.93 erg/cm²/s/sr — fallback scale for unconditional generation
 VEL_MEAN     = float(_STATS['vel_mean'])       # -1.0849 km/s
 VEL_STD      = float(_STATS['vel_std'])        # 9.0853 km/s
 WIDTH_MEAN   = float(_STATS['width_mean'])     # 0.028477 Å
@@ -26,7 +26,7 @@ def _exp(x):
 class GlobalLogzNorm:
     """Global log-zscore for intensity, z-score for velocity and line width.
 
-    Operates in physical units: intensity in DN, velocity in km/s, width in Å.
+    Operates in physical units: intensity in erg/cm²/s/sr, velocity in km/s, width in Å.
     All stats derived from dset_v6 training set.
     """
     name = 'global_logz'
@@ -137,7 +137,7 @@ class PersampleLinearNorm:
                 if scale.shape[0] != x.shape[0]:
                     # Batch size mismatch — global mean is the safe fallback
                     scale = INT_MEAN
-            x[:, 0] = (x[:, 0] + 1) / 2 * scale  # [-1,1] → [0,1] → DN
+            x[:, 0] = (x[:, 0] + 1) / 2 * scale  # [-1,1] → [0,1] → erg/cm²/s/sr
         if self.rec_mode == 'all':
             x[:, 1] = x[:, 1] * VEL_STD + VEL_MEAN
             x[:, 2] = x[:, 2] * WIDTH_STD + WIDTH_MEAN

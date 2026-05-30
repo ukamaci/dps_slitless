@@ -13,7 +13,9 @@ VEL_TO_PIX       = WAVELENGTH / SPEEDOFLIGHT / DISPERSION_SCALE   # km/s → pix
 WIDTH_TO_PIX      = 1.0 / DISPERSION_SCALE                         # Å    → pixels (~44.89)
 
 # ── config ────────────────────────────────────────────────────────────────────
-run_folder  = './training_results/exp_norm_logz_dset6_lr5e-6'   # training run to load
+# run_folder  = './training_results/exp_norm_logz_dset6_lr5e-6'   # training run to load
+# run_folder  = './training_results/run_all_lr_1e-4_cosine_b32_logz'   # training run to load
+run_folder  = './training_results/run_all_lr1e-4_cosine_b32_conditional_linear'   # training run to load
 # run_folder  = './training_results/exp_norm_persample_dset6_lr5e-6'   # training run to load
 milestone   = 10                             # model-{milestone}.pt
 rec_mode    = 'all'
@@ -35,6 +37,8 @@ except FileNotFoundError:
     norm_mode = 'global_logz'   # default for runs pre-dating config.json
 
 normalization = make_normalization(norm_mode, rec_mode=rec_mode)
+method      = run_config.get('method', 'dps')          # 'dps' or 'conditional'
+cond_orders = run_config.get('cond_orders', None)       # e.g. [0, -1, 1] for conditional
 
 # ── load test data (physical units) ───────────────────────────────────────────
 test_files = sorted(glob.glob(DATA_DIR + '/data*.npy'))
@@ -80,6 +84,7 @@ def forward_op(x, device=None):
 # ── model ─────────────────────────────────────────────────────────────────────
 model = Unet(
     channels=channels,
+    cond_channels=len(cond_orders) if cond_orders else 0,
     dim=64,
     dim_mults=(1, 2, 4, 8),
     flash_attn=True
@@ -90,65 +95,93 @@ adapted = {k[6:]: v for k, v in ckpt['model'].items() if k.startswith('model.')}
 model.load_state_dict(adapted)
 model.eval()
 
-# ── diffusion + DPS ───────────────────────────────────────────────────────────
-diffusion = GaussianDiffusion(
-    model,
-    mode=rec_mode,
-    image_size=64,
-    timesteps=1000,
-    sampling_timesteps=1000,
-    recon=True,
-    measurement=meas,
-    true=true,
-    beta_schedule='cosine',
-    clip_denoised=(-5., 5.),
-    grad_scale=torch.tensor([0.5]).to(device),
-    forward_op=forward_op,
-    device=device,
-    normalization=normalization,
-)
-
-samples, norms, grad_norms, rmses, ch_grad_norms = diffusion.sample(batch_size=num_samples)
-samples  = samples.detach().cpu().numpy()   # (num_samples, C, H, W) — physical units
-true_np  = true.detach().cpu().numpy()
-rmses    = np.array(rmses).squeeze()
-if len(rmses.shape) == 3:
-    rmses = rmses.mean(axis=1)
-
-ch_grad_norms = np.array(ch_grad_norms)   # (T, C)
+# ── diffusion ─────────────────────────────────────────────────────────────────
 ch_labels = (['int', 'vel', 'width'] if rec_mode == 'all' else [rec_mode])
+w_fac     = SPEEDOFLIGHT / WAVELENGTH
 
-# ── diagnostic plots ──────────────────────────────────────────────────────────
-plt.figure(); plt.plot(norms);      plt.title('Norms');      plt.grid(); plt.show()
-plt.figure(); plt.plot(grad_norms); plt.title('Grad Norms'); plt.grid(); plt.show()
-plt.figure()
-plt.semilogy(rmses)
-plt.legend(['int', 'vel', 'width'] if rec_mode == 'all' else [rec_mode])
-plt.title('RMSEs'); plt.grid(); plt.show()
+if method == 'conditional':
+    cond1 = torch.stack([meas[:, cond_orders.index(o)] for o in cond_orders], dim=1) \
+            if cond_orders else meas                                 # (1, K, H, W)
 
-fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-for c, lbl in enumerate(ch_labels):
-    axes[0].semilogy(ch_grad_norms[:, c], label=lbl)
-    axes[1].plot(ch_grad_norms[:, c], label=lbl)
-axes[0].set_title('Per-channel grad norms (log)'); axes[0].legend(); axes[0].grid()
-axes[1].set_title('Per-channel grad norms (linear)'); axes[1].legend(); axes[1].grid()
-plt.tight_layout(); plt.show()
+    diffusion = GaussianDiffusion(
+        model,
+        mode=rec_mode,
+        image_size=64,
+        timesteps=1000,
+        sampling_timesteps=250,
+        beta_schedule='cosine',
+        clip_denoised=(-5., 5.),
+        device=device,
+        normalization=normalization,
+    )
 
-# print mean effective step per channel
-gs = diffusion.grad_scale.cpu().numpy()
-if gs.shape[0] == 1:
-    gs = np.repeat(gs, len(ch_labels))
-mean_ch_gnorm = ch_grad_norms.mean(axis=0)
-print('Mean per-channel grad norm:   ' + '  '.join(f'{lbl}={v:.4f}' for lbl, v in zip(ch_labels, mean_ch_gnorm)))
-print('Effective step (gs * gnorm):  ' + '  '.join(f'{lbl}={v:.4f}' for lbl, v in zip(ch_labels, gs * mean_ch_gnorm)))
+    # sample one at a time; inference_mode prevents graph accumulation across steps
+    samples_list = []
+    for _ in range(num_samples):
+        with torch.inference_mode():
+            s = diffusion.sample(batch_size=1, cond=cond1)
+        samples_list.append(s.cpu().numpy())
+    samples = np.concatenate(samples_list, axis=0)   # (num_samples, C, H, W) — physical units
+
+else:
+    # ── DPS ───────────────────────────────────────────────────────────────────
+    diffusion = GaussianDiffusion(
+        model,
+        mode=rec_mode,
+        image_size=64,
+        timesteps=1000,
+        sampling_timesteps=1000,
+        recon=True,
+        measurement=meas,
+        true=true,
+        beta_schedule='cosine',
+        clip_denoised=(-5., 5.),
+        grad_scale=torch.tensor([0.5]).to(device),
+        forward_op=forward_op,
+        device=device,
+        normalization=normalization,
+    )
+
+    samples, norms, grad_norms, rmses, ch_grad_norms = diffusion.sample(batch_size=num_samples)
+    samples  = samples.detach().cpu().numpy()
+    rmses    = np.array(rmses).squeeze()
+    if len(rmses.shape) == 3:
+        rmses = rmses.mean(axis=1)
+    if rec_mode == 'all':
+        rmses[:, 2] *= w_fac
+    elif rec_mode == 'width':
+        rmses *= w_fac
+
+    ch_grad_norms = np.array(ch_grad_norms)   # (T, C)
+
+    # ── DPS diagnostic plots ──────────────────────────────────────────────────
+    plt.figure(); plt.plot(norms);      plt.title('Norms');      plt.grid(); plt.show()
+    plt.figure(); plt.plot(grad_norms); plt.title('Grad Norms'); plt.grid(); plt.show()
+    plt.figure()
+    plt.semilogy(rmses)
+    plt.legend(['int (erg/cm²/s/sr)', 'vel (km/s)', 'width (km/s)'] if rec_mode == 'all' else [rec_mode])
+    plt.title('RMSEs'); plt.grid(); plt.show()
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    for c, lbl in enumerate(ch_labels):
+        axes[0].semilogy(ch_grad_norms[:, c], label=lbl)
+        axes[1].plot(ch_grad_norms[:, c], label=lbl)
+    axes[0].set_title('Per-channel grad norms (log)'); axes[0].legend(); axes[0].grid()
+    axes[1].set_title('Per-channel grad norms (linear)'); axes[1].legend(); axes[1].grid()
+    plt.tight_layout(); plt.show()
+
+    gs = diffusion.grad_scale.cpu().numpy()
+    if gs.shape[0] == 1:
+        gs = np.repeat(gs, len(ch_labels))
+    mean_ch_gnorm = ch_grad_norms.mean(axis=0)
+    print('Mean per-channel grad norm:   ' + '  '.join(f'{lbl}={v:.4f}' for lbl, v in zip(ch_labels, mean_ch_gnorm)))
+    print('Effective step (gs * gnorm):  ' + '  '.join(f'{lbl}={v:.4f}' for lbl, v in zip(ch_labels, gs * mean_ch_gnorm)))
 
 # ── RMSE in physical units ────────────────────────────────────────────────────
 if rec_mode == 'all':
     true_r   = true_np[0]                             # (3,H,W)
     mean_r   = samples.mean(axis=0)                   # (3,H,W)
 
-    # convert width Å → km/s for reporting
-    w_fac = SPEEDOFLIGHT / WAVELENGTH
     def rmse_ch(a, b):
         return np.sqrt(np.mean((a - b)**2, axis=(-1, -2)))
 
@@ -157,8 +190,8 @@ if rec_mode == 'all':
     rmse_all  = np.stack([rmse_ch(true_r, s) for s in samples])
     rmse_all[:, 2] *= w_fac
 
-    print(f'RMSE (posterior mean): int={rmse_mean[0]:.1f} DN, vel={rmse_mean[1]:.2f} km/s, width={rmse_mean[2]:.2f} km/s')
-    print(f'RMSE (samples mean):   int={rmse_all[:,0].mean():.1f} DN, vel={rmse_all[:,1].mean():.2f} km/s, width={rmse_all[:,2].mean():.2f} km/s')
+    print(f'RMSE (posterior mean): int={rmse_mean[0]:.1f} erg/cm²/s/sr, vel={rmse_mean[1]:.2f} km/s, width={rmse_mean[2]:.2f} km/s')
+    print(f'RMSE (samples mean):   int={rmse_all[:,0].mean():.1f} erg/cm²/s/sr, vel={rmse_all[:,1].mean():.2f} km/s, width={rmse_all[:,2].mean():.2f} km/s')
 
     # ── reconstruction grid ───────────────────────────────────────────────────
     recs   = [meas[0].cpu().numpy(), true_np[0], samples[0], samples[1], samples[2], mean_r]

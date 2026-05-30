@@ -6,11 +6,15 @@ from denoising_diffusion_pytorch import Unet, GaussianDiffusion
 from denoising_diffusion_pytorch.normalization import make_normalization
 from slitless.forward import forward_op_torch
 
-SPEEDOFLIGHT = 299792.458
-WAVELENGTH   = 195.117937907451
+SPEEDOFLIGHT     = 299792.458
+WAVELENGTH       = 195.117937907451
+DISPERSION_SCALE = 0.022275   # Å/pixel  (EIS: 13.5 µm pixel / (1/1.65 µm/mÅ) / 1000)
+VEL_TO_PIX       = WAVELENGTH / SPEEDOFLIGHT / DISPERSION_SCALE   # km/s → pixels (~0.02922)
+WIDTH_TO_PIX      = 1.0 / DISPERSION_SCALE                         # Å    → pixels (~44.89)
 
 # ── config ────────────────────────────────────────────────────────────────────
-run_folder  = './training_results/results'   # training run to load
+run_folder  = './training_results/exp_norm_logz_dset6_lr5e-6'   # training run to load
+# run_folder  = './training_results/exp_norm_persample_dset6_lr5e-6'   # training run to load
 milestone   = 10                             # model-{milestone}.pt
 rec_mode    = 'all'
 sample_idx  = 0                              # which dset_v6 test sample to reconstruct
@@ -58,17 +62,20 @@ if norm_mode == 'persample_linear':
     normalization.set_infer_scale(meas[:, 0].max())
 
 # ── forward operator (physical units → measurements) ─────────────────────────
+# forward_op_torch expects velocity and linewidth in pixel units, not km/s / Å.
 def forward_op(x, device=None):
     if rec_mode == 'int':
         return torch.nn.Identity()(x)
     elif rec_mode == 'vel':
         int_fixed = true[:, 0].repeat(x.shape[0], 1, 1)
         wid_fixed = true[:, 2].repeat(x.shape[0], 1, 1)
-        return forward_op_torch(true_intensity=int_fixed, true_doppler=x[:, 0],
-                                true_linewidth=wid_fixed, device=device)
+        return forward_op_torch(true_intensity=int_fixed,
+                                true_doppler=x[:, 0] * VEL_TO_PIX,
+                                true_linewidth=wid_fixed * WIDTH_TO_PIX, device=device)
     else:
-        return forward_op_torch(true_intensity=x[:, 0], true_doppler=x[:, 1],
-                                true_linewidth=x[:, 2], device=device)
+        return forward_op_torch(true_intensity=x[:, 0],
+                                true_doppler=x[:, 1] * VEL_TO_PIX,
+                                true_linewidth=x[:, 2] * WIDTH_TO_PIX, device=device)
 
 # ── model ─────────────────────────────────────────────────────────────────────
 model = Unet(
@@ -95,18 +102,21 @@ diffusion = GaussianDiffusion(
     true=true,
     beta_schedule='cosine',
     clip_denoised=(-5., 5.),
-    grad_scale=torch.tensor([1.]).to(device),
+    grad_scale=torch.tensor([0.5]).to(device),
     forward_op=forward_op,
     device=device,
     normalization=normalization,
 )
 
-samples, norms, grad_norms, rmses = diffusion.sample(batch_size=num_samples)
+samples, norms, grad_norms, rmses, ch_grad_norms = diffusion.sample(batch_size=num_samples)
 samples  = samples.detach().cpu().numpy()   # (num_samples, C, H, W) — physical units
 true_np  = true.detach().cpu().numpy()
 rmses    = np.array(rmses).squeeze()
 if len(rmses.shape) == 3:
     rmses = rmses.mean(axis=1)
+
+ch_grad_norms = np.array(ch_grad_norms)   # (T, C)
+ch_labels = (['int', 'vel', 'width'] if rec_mode == 'all' else [rec_mode])
 
 # ── diagnostic plots ──────────────────────────────────────────────────────────
 plt.figure(); plt.plot(norms);      plt.title('Norms');      plt.grid(); plt.show()
@@ -115,6 +125,22 @@ plt.figure()
 plt.semilogy(rmses)
 plt.legend(['int', 'vel', 'width'] if rec_mode == 'all' else [rec_mode])
 plt.title('RMSEs'); plt.grid(); plt.show()
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+for c, lbl in enumerate(ch_labels):
+    axes[0].semilogy(ch_grad_norms[:, c], label=lbl)
+    axes[1].plot(ch_grad_norms[:, c], label=lbl)
+axes[0].set_title('Per-channel grad norms (log)'); axes[0].legend(); axes[0].grid()
+axes[1].set_title('Per-channel grad norms (linear)'); axes[1].legend(); axes[1].grid()
+plt.tight_layout(); plt.show()
+
+# print mean effective step per channel
+gs = diffusion.grad_scale.cpu().numpy()
+if gs.shape[0] == 1:
+    gs = np.repeat(gs, len(ch_labels))
+mean_ch_gnorm = ch_grad_norms.mean(axis=0)
+print('Mean per-channel grad norm:   ' + '  '.join(f'{lbl}={v:.4f}' for lbl, v in zip(ch_labels, mean_ch_gnorm)))
+print('Effective step (gs * gnorm):  ' + '  '.join(f'{lbl}={v:.4f}' for lbl, v in zip(ch_labels, gs * mean_ch_gnorm)))
 
 # ── RMSE in physical units ────────────────────────────────────────────────────
 if rec_mode == 'all':
@@ -150,7 +176,8 @@ if rec_mode == 'all':
     for col, (rec, title) in enumerate(zip(recs, titles)):
         for row in range(3):
             data = rec[row] if rec.shape[0] > row else rec[0]
-            ax[row, col].imshow(data, cmap=cmaps[row],
+            cmap = 'hot' if col == 0 else cmaps[row]
+            ax[row, col].imshow(data, cmap=cmap,
                                 vmin=vmins[row] if col > 0 else None,
                                 vmax=vmaxs[row] if col > 0 else None)
             ax[row, col].axis('off')

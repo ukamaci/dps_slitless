@@ -3,11 +3,13 @@ from denoising_diffusion_pytorch.normalization import make_normalization
 
 mode = 'all'
 norm_mode = 'global_logz'
+cond_orders = None          # set to e.g. [0, -1, 1] for conditional training
 results_folder = './training_results/run_all_lr5e-6_cosine_b32'
 
 model = Unet(
     dim = 64,
     channels = 3,
+    cond_channels = len(cond_orders) if cond_orders else 0,
     dim_mults = (1, 2, 4, 8),
     flash_attn = True
 )
@@ -26,7 +28,9 @@ diffusion = GaussianDiffusion(
 )
 
 config = dict(
+    method = 'conditional' if cond_orders else 'unconditional',
     mode = mode,
+    cond_orders = cond_orders,
     image_size = 64,
     timesteps = 1000,
     sampling_timesteps = 250,
@@ -47,6 +51,7 @@ trainer = Trainer(
     diffusion,
     config['dataset_path'],
     mode = config['mode'],
+    cond_orders = config['cond_orders'],
     results_folder = config['results_folder'],
     train_batch_size = config['train_batch_size'],
     train_lr = config['train_lr'],

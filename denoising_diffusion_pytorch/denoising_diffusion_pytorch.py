@@ -303,6 +303,7 @@ class Unet(Module):
         out_dim = None,
         dim_mults = (1, 2, 4, 8),
         channels = 3,
+        cond_channels = 0,
         self_condition = False,
         learned_variance = False,
         learned_sinusoidal_cond = False,
@@ -320,8 +321,9 @@ class Unet(Module):
         # determine dimensions
 
         self.channels = channels
+        self.cond_channels = cond_channels
         self.self_condition = self_condition
-        input_channels = channels * (2 if self_condition else 1)
+        input_channels = channels * (2 if self_condition else 1) + cond_channels
 
         init_dim = default(init_dim, dim)
         self.init_conv = nn.Conv2d(input_channels, init_dim, 7, padding = 3)
@@ -411,12 +413,15 @@ class Unet(Module):
     def downsample_factor(self):
         return 2 ** (len(self.downs) - 1)
 
-    def forward(self, x, time, x_self_cond = None):
+    def forward(self, x, time, x_self_cond = None, cond = None):
         assert all([divisible_by(d, self.downsample_factor) for d in x.shape[-2:]]), f'your input dimensions {x.shape[-2:]} need to be divisible by {self.downsample_factor}, given the unet'
 
         if self.self_condition:
             x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
             x = torch.cat((x_self_cond, x), dim = 1)
+
+        if cond is not None:
+            x = torch.cat((x, cond), dim = 1)
 
         x = self.init_conv(x)
         r = x.clone()
@@ -541,6 +546,7 @@ class GaussianDiffusion(Module):
             self.measurement = measurement
             self.grad_scale = grad_scale
             self.forward_op = forward_op
+            self.meas_scale = measurement.pow(2).mean().sqrt().item() if measurement is not None else 1.0
 
         if isinstance(image_size, int):
             image_size = (image_size, image_size)
@@ -688,8 +694,8 @@ class GaussianDiffusion(Module):
         lo, hi = (-1., 1.) if self.clip_denoised is True else self.clip_denoised
         return x.clamp(lo, hi)
 
-    def model_predictions(self, x, t, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False):
-        model_output = self.model(x, t, x_self_cond)
+    def model_predictions(self, x, t, x_self_cond = None, cond = None, clip_x_start = False, rederive_pred_noise = False):
+        model_output = self.model(x, t, x_self_cond, cond = cond)
         maybe_clip = self._clip if clip_x_start else identity
 
         if self.objective == 'pred_noise':
@@ -713,8 +719,8 @@ class GaussianDiffusion(Module):
 
         return ModelPrediction(pred_noise, x_start)
 
-    def p_mean_variance(self, x, t, x_self_cond = None, clip_denoised = True):
-        preds = self.model_predictions(x, t, x_self_cond)
+    def p_mean_variance(self, x, t, x_self_cond = None, cond = None, clip_denoised = True):
+        preds = self.model_predictions(x, t, x_self_cond, cond = cond)
         x_start = preds.pred_x_start
 
         if clip_denoised:
@@ -724,28 +730,27 @@ class GaussianDiffusion(Module):
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
     # @torch.inference_mode()
-    def p_sample(self, x, t: int, x_self_cond = None):
+    def p_sample(self, x, t: int, x_self_cond = None, cond = None):
         b, *_, device = *x.shape, self.device
         batched_times = torch.full((b,), t, device = device, dtype = torch.long)
         if not self.recon:
             with torch.no_grad():
-                model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = self.clip_denoised)
+                model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, cond = cond, clip_denoised = self.clip_denoised)
         else:
-            model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = True)
+            model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, cond = cond, clip_denoised = True)
         noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
         pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
         return pred_img, x_start
 
     def grad_and_value(self, x_prev, x_0_hat, measurement):
         x_0_hat = self.unnormalize(x_0_hat)
-        difference = measurement - self.forward_op(x_0_hat, device=self.device)
+        difference = (measurement - self.forward_op(x_0_hat, device=self.device)) / self.meas_scale
         norm = torch.sqrt(torch.sum(difference**2, dim=(1,2,3))).sum()
-        # norm = torch.sum(difference**2, dim=(1,2,3)).sum()
         norm_grad = torch.autograd.grad(outputs=norm, inputs=x_prev)[0]
         return norm_grad, norm
 
     # @torch.inference_mode()
-    def p_sample_loop(self, shape, return_all_timesteps = False):
+    def p_sample_loop(self, shape, return_all_timesteps = False, cond = None):
         batch, device = shape[0], self.device
 
         if self.recon:
@@ -760,17 +765,21 @@ class GaussianDiffusion(Module):
         x_start = None
         norms = []
         grad_norms = []
+        ch_grad_norms = []   # per-channel gradient norms: list of (C,) arrays
         rmses = []
+
+        if self.recon:
+            print(f'[DPS] meas_scale={self.meas_scale:.3f}  grad_scale={self.grad_scale.tolist()}')
 
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
             self_cond = x_start if self.self_condition else None
             if self.recon:
                 img = img.requires_grad_()
-                pred_img, x_start = self.p_sample(img, t, self_cond)
+                pred_img, x_start = self.p_sample(img, t, self_cond, cond = cond)
 
                 norm_grad, norm = self.grad_and_value(
-                    x_prev=img, 
-                    x_0_hat=x_start, 
+                    x_prev=img,
+                    x_0_hat=x_start,
                     measurement=self.measurement
                 )
                 img = pred_img - norm_grad * self.grad_scale [None,:,None,None]
@@ -782,8 +791,10 @@ class GaussianDiffusion(Module):
                     rmses.append(torch.sqrt(torch.mean((self.unnormalize(img.detach().clone()) - self.true)**2, dim=(-1,-2))).cpu().numpy())
                 norms.append(norm.detach().cpu().numpy())
                 grad_norms.append(torch.linalg.norm(norm_grad.detach()).cpu().numpy())
+                # per-channel: spatial L2 norm, averaged over batch
+                ch_grad_norms.append(norm_grad.detach().norm(dim=(-1, -2)).mean(dim=0).cpu().numpy())
             else:
-                img, x_start = self.p_sample(img, t, self_cond)
+                img, x_start = self.p_sample(img, t, self_cond, cond = cond)
 
             imgs.append(img)
 
@@ -792,12 +803,12 @@ class GaussianDiffusion(Module):
 
         ret = self.unnormalize(ret)
         if self.recon:
-            return ret, norms, grad_norms, rmses
+            return ret, norms, grad_norms, rmses, ch_grad_norms
         else:
             return ret
 
     # @torch.inference_mode()
-    def ddim_sample(self, shape, return_all_timesteps = False):
+    def ddim_sample(self, shape, return_all_timesteps = False, cond = None):
         batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
         times = torch.linspace(-1, total_timesteps - 1, steps = sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
@@ -813,14 +824,18 @@ class GaussianDiffusion(Module):
         x_start = None
         norms = []
         grad_norms = []
+        ch_grad_norms = []
         rmses = []
+
+        if self.recon:
+            print(f'[DPS] meas_scale={self.meas_scale:.3f}  grad_scale={self.grad_scale.tolist()}')
 
         for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
             if self.recon:
                 img = img.requires_grad_()
             time_cond = torch.full((batch,), time, device = device, dtype = torch.long)
             self_cond = x_start if self.self_condition else None
-            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, clip_x_start = self.clip_denoised, rederive_pred_noise = True)
+            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, cond = cond, clip_x_start = self.clip_denoised, rederive_pred_noise = True)
 
             if time_next < 0:
                 img = x_start
@@ -840,14 +855,15 @@ class GaussianDiffusion(Module):
                     c * pred_noise + \
                     sigma * noise
                 norm_grad, norm = self.grad_and_value(
-                    x_prev=img, 
-                    x_0_hat=x_start, 
+                    x_prev=img,
+                    x_0_hat=x_start,
                     measurement=self.measurement
                 )
                 pred_img -= norm_grad * self.grad_scale[None,:,None,None]
                 img = pred_img.detach_()
                 norms.append(norm.detach().cpu().numpy())
                 grad_norms.append(torch.linalg.norm(norm_grad.detach()).cpu().numpy())
+                ch_grad_norms.append(norm_grad.detach().norm(dim=(-1, -2)).mean(dim=0).cpu().numpy())
                 rmses.append(torch.sqrt(torch.mean((self.unnormalize(img.detach().clone()) - self.true)**2, dim=(-1,-2))).cpu().numpy())
 
             else:
@@ -861,15 +877,15 @@ class GaussianDiffusion(Module):
 
         ret = self.unnormalize(ret)
         if self.recon:
-            return ret, norms, grad_norms, rmses
+            return ret, norms, grad_norms, rmses, ch_grad_norms
         else:
             return ret
 
     # @torch.inference_mode()
-    def sample(self, batch_size = 16, return_all_timesteps = False):
+    def sample(self, batch_size = 16, return_all_timesteps = False, cond = None):
         (h, w), channels = self.image_size, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
-        return sample_fn((batch_size, channels, h, w), return_all_timesteps = return_all_timesteps)
+        return sample_fn((batch_size, channels, h, w), return_all_timesteps = return_all_timesteps, cond = cond)
 
     @torch.inference_mode()
     def interpolate(self, x1, x2, t = None, lam = 0.5):
@@ -910,7 +926,7 @@ class GaussianDiffusion(Module):
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, noise = None, offset_noise_strength = None):
+    def p_losses(self, x_start, t, noise = None, offset_noise_strength = None, cond = None):
         b, c, h, w = x_start.shape
 
         noise = default(noise, lambda: torch.randn_like(x_start))
@@ -934,12 +950,12 @@ class GaussianDiffusion(Module):
         x_self_cond = None
         if self.self_condition and random() < 0.5:
             with torch.no_grad():
-                x_self_cond = self.model_predictions(x, t).pred_x_start
+                x_self_cond = self.model_predictions(x, t, cond = cond).pred_x_start
                 x_self_cond.detach_()
 
         # predict and take gradient step
 
-        model_out = self.model(x, t, x_self_cond)
+        model_out = self.model(x, t, x_self_cond, cond = cond)
 
         if self.objective == 'pred_noise':
             target = noise
@@ -971,7 +987,8 @@ class EISDataset(Dataset):
     def __init__(
         self,
         folder,
-        mode='all'
+        mode='all',
+        cond_orders=None,   # e.g. [0, -1, 1]; when set, __getitem__ returns (params, meas)
         # image_size,
         # exts = ['jpg', 'jpeg', 'png', 'tiff'],
         # augment_horizontal_flip = False,
@@ -981,6 +998,7 @@ class EISDataset(Dataset):
         self.folder = folder
         self.paths = glob.glob(self.folder+'/data*.npy')
         self.mode = mode
+        self.cond_orders = cond_orders
 
         # maybe_convert_fn = partial(convert_image_to_fn, convert_image_to) if exists(convert_image_to) else nn.Identity()
 
@@ -1009,6 +1027,12 @@ class EISDataset(Dataset):
             params = data['width'][None,:]
 
         params = torch.tensor(params, dtype=torch.float32)
+
+        if self.cond_orders is not None:
+            meas = np.stack([data[f'meas_{o}'] for o in self.cond_orders])
+            meas = torch.tensor(meas, dtype=torch.float32)
+            return params, meas
+
         return params
 
 # trainer class
@@ -1020,6 +1044,7 @@ class Trainer:
         folder,
         *,
         mode = 'all',
+        cond_orders = None,   # e.g. [0, -1, 1] for conditional training; None = unconditional
         train_batch_size = 16,
         gradient_accumulate_every = 1,
         train_lr = 1e-4,
@@ -1045,6 +1070,7 @@ class Trainer:
         # accelerator
 
         self.mode = mode
+        self.cond_orders = cond_orders
         self.accelerator = Accelerator(
             split_batches = split_batches,
             mixed_precision = mixed_precision_type if amp else 'no'
@@ -1078,9 +1104,16 @@ class Trainer:
         # dataset and dataloader
 
         # self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
-        self.ds = EISDataset(folder, self.mode)
+        self.ds = EISDataset(folder, self.mode, cond_orders=cond_orders)
 
         assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
+
+        # store a fixed validation cond batch for periodic conditional sampling
+        if cond_orders is not None:
+            val_items = [self.ds[i] for i in range(min(num_samples, len(self.ds)))]
+            self.val_cond = torch.stack([item[1] for item in val_items])
+        else:
+            self.val_cond = None
 
         dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
 
@@ -1224,10 +1257,14 @@ class Trainer:
                     total_loss = 0.
 
                     for _ in range(self.gradient_accumulate_every):
-                        data = next(self.dl).to(device)
+                        batch = next(self.dl)
+                        if self.cond_orders is not None:
+                            data, cond = batch[0].to(device), batch[1].to(device)
+                        else:
+                            data, cond = batch.to(device), None
 
                         with self.accelerator.autocast():
-                            loss = self.model(data)
+                            loss = self.model(data, cond=cond)
                             loss = loss / self.gradient_accumulate_every
                             total_loss += loss.item()
 
@@ -1254,7 +1291,14 @@ class Trainer:
                             with torch.inference_mode():
                                 milestone = self.step // self.save_and_sample_every
                                 batches = num_to_groups(self.num_samples, self.batch_size)
-                                all_images_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
+                                if self.val_cond is not None:
+                                    val_cond_dev = self.val_cond.to(self.device)
+                                    offset, all_images_list = 0, []
+                                    for n in batches:
+                                        all_images_list.append(self.ema.ema_model.sample(batch_size=n, cond=val_cond_dev[offset:offset+n]))
+                                        offset += n
+                                else:
+                                    all_images_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
 
                             all_images = torch.cat(all_images_list, dim = 0)
 

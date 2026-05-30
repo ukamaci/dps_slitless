@@ -885,6 +885,8 @@ class GaussianDiffusion(Module):
     def sample(self, batch_size = 16, return_all_timesteps = False, cond = None):
         (h, w), channels = self.image_size, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
+        if cond is not None:
+            cond = self.normalization.normalize_cond(cond)   # match training; uses meas[:,0] as intensity scale
         return sample_fn((batch_size, channels, h, w), return_all_timesteps = return_all_timesteps, cond = cond)
 
     @torch.inference_mode()
@@ -978,7 +980,10 @@ class GaussianDiffusion(Module):
         assert h == img_size[0] and w == img_size[1], f'height and width of image must be {img_size}'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
-        img = self.normalize(img)
+        img = self.normalize(img)   # sets per-sample intensity scale (persample_linear)
+        cond = kwargs.get('cond', None)
+        if cond is not None:
+            kwargs['cond'] = self.normalization.normalize_cond(cond)   # share intensity scale
         return self.p_losses(img, t, *args, **kwargs)
 
 # dataset classes
@@ -1115,7 +1120,7 @@ class Trainer:
         else:
             self.val_cond = None
 
-        dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
+        dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = min(8, cpu_count()))
 
         dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
@@ -1131,9 +1136,9 @@ class Trainer:
             self.ema.to(self.device)
 
         self.results_folder = Path(results_folder)
-        self.results_folder.mkdir(exist_ok = True)
+        self.results_folder.mkdir(parents = True, exist_ok = True)
         self.periodic_samples_folder = self.results_folder / 'periodic_samples'
-        self.periodic_samples_folder.mkdir(exist_ok = True)
+        self.periodic_samples_folder.mkdir(parents = True, exist_ok = True)
 
         # step counter state
 

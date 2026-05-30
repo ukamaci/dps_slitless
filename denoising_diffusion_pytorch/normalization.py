@@ -49,6 +49,14 @@ class GlobalLogzNorm:
             x[:, 0] = (x[:, 0] - WIDTH_MEAN) / WIDTH_STD
         return x
 
+    def normalize_cond(self, cond):
+        """Normalize conditioning measurements (intensity-like DN) → log-zscore.
+
+        Measurements share the intensity channel's transform (same physical quantity).
+        cond: (B, n_cond, H, W) raw DN.
+        """
+        return (_log(cond) - INT_LOG_MEAN) / INT_LOG_STD
+
     def inverse(self, x):
         """Normalized → physical (B, C, H, W)."""
         x = x.clone()
@@ -96,6 +104,20 @@ class PersampleLinearNorm:
         elif self.rec_mode == 'width':
             x[:, 0] = (x[:, 0] - WIDTH_MEAN) / WIDTH_STD
         return x
+
+    def normalize_cond(self, cond):
+        """Normalize conditioning measurements using the param intensity's per-sample scale.
+
+        Measurements are intensity-like (DN) and share the intensity channel's scale:
+        - Training: self._scale set by forward() from the param intensity max.
+        - Inference: self._scale is None (forward never called on EMA model) — fall back
+          to the zeroth-order measurement cond[:, 0], which is the direct intensity proxy.
+        cond: (B, n_cond, H, W) raw DN → [-1, 1].
+        """
+        scale = self._scale
+        if not torch.is_tensor(scale):
+            scale = cond[:, [0]].amax(dim=(-1, -2), keepdim=True).clamp(min=1.0)
+        return cond / scale * 2 - 1
 
     def inverse(self, x):
         """Normalized → physical (B, C, H, W). Uses _scale set by forward() or set_infer_scale().

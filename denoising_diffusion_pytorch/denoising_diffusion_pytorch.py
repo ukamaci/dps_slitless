@@ -988,12 +988,14 @@ class GaussianDiffusion(Module):
 
 # dataset classes
 
+_DIFFRACTION_ORDERS = [0, -1, 1, -2, 2]
+
 class EISDataset(Dataset):
     def __init__(
         self,
         folder,
         mode='all',
-        cond_orders=None,   # e.g. [0, -1, 1]; when set, __getitem__ returns (params, meas)
+        numdetectors=0,     # 0 = unconditional; >0 = conditional with _DIFFRACTION_ORDERS[:n]
         dbsnr=None,         # dB SNR for measurement noise; None = no noise
         noise_model='Gaussian',
         # image_size,
@@ -1005,7 +1007,7 @@ class EISDataset(Dataset):
         self.folder = folder
         self.paths = glob.glob(self.folder+'/data*.npy')
         self.mode = mode
-        self.cond_orders = cond_orders
+        self.cond_orders = _DIFFRACTION_ORDERS[:numdetectors] if numdetectors > 0 else None
         self.dbsnr = dbsnr
         self.noise_model = noise_model
 
@@ -1055,7 +1057,7 @@ class Trainer:
         folder,
         *,
         mode = 'all',
-        cond_orders = None,   # e.g. [0, -1, 1] for conditional training; None = unconditional
+        numdetectors = 0,     # 0 = unconditional; >0 = conditional with _DIFFRACTION_ORDERS[:n]
         dbsnr = None,         # dB SNR for measurement noise; None = no noise
         noise_model = 'Gaussian',
         train_batch_size = 16,
@@ -1083,7 +1085,7 @@ class Trainer:
         # accelerator
 
         self.mode = mode
-        self.cond_orders = cond_orders
+        self.numdetectors = numdetectors
         self.accelerator = Accelerator(
             split_batches = split_batches,
             mixed_precision = mixed_precision_type if amp else 'no'
@@ -1117,13 +1119,13 @@ class Trainer:
         # dataset and dataloader
 
         # self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
-        self.ds = EISDataset(folder, self.mode, cond_orders=cond_orders,
+        self.ds = EISDataset(folder, self.mode, numdetectors=numdetectors,
                              dbsnr=dbsnr, noise_model=noise_model)
 
         assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
 
         # store a fixed validation cond batch for periodic conditional sampling
-        if cond_orders is not None:
+        if numdetectors > 0:
             val_items = [self.ds[i] for i in range(min(num_samples, len(self.ds)))]
             self.val_cond = torch.stack([item[1] for item in val_items])
         else:
@@ -1272,7 +1274,7 @@ class Trainer:
 
                     for _ in range(self.gradient_accumulate_every):
                         batch = next(self.dl)
-                        if self.cond_orders is not None:
+                        if self.numdetectors > 0:
                             data, cond = batch[0].to(device), batch[1].to(device)
                         else:
                             data, cond = batch.to(device), None

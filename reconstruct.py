@@ -38,8 +38,8 @@ except FileNotFoundError:
     norm_mode = 'global_logz'   # default for runs pre-dating config.json
 
 normalization = make_normalization(norm_mode, rec_mode=rec_mode)
-method      = run_config.get('method', 'dps')          # 'dps' or 'conditional'
-cond_orders = run_config.get('cond_orders', None)       # e.g. [0, -1, 1] for conditional
+method       = run_config.get('method', 'dps')
+numdetectors = run_config.get('numdetectors', numdetectors)
 
 # ── load test data (physical units) ───────────────────────────────────────────
 test_files = sorted(glob.glob(DATA_DIR + '/data*.npy'))
@@ -85,7 +85,7 @@ def forward_op(x, device=None):
 # ── model ─────────────────────────────────────────────────────────────────────
 model = Unet(
     channels=channels,
-    cond_channels=len(cond_orders) if cond_orders else 0,
+    cond_channels=numdetectors,
     dim=64,
     dim_mults=(1, 2, 4, 8),
     flash_attn=True
@@ -101,8 +101,7 @@ ch_labels = (['int', 'vel', 'width'] if rec_mode == 'all' else [rec_mode])
 w_fac     = SPEEDOFLIGHT / WAVELENGTH
 
 if method == 'conditional':
-    cond1 = torch.stack([meas[:, cond_orders.index(o)] for o in cond_orders], dim=1) \
-            if cond_orders else meas                                 # (1, K, H, W)
+    cond1 = meas[:, :numdetectors]                                   # (1, K, H, W)
 
     diffusion = GaussianDiffusion(
         model,

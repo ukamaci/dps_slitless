@@ -3,7 +3,9 @@ from denoising_diffusion_pytorch.normalization import make_normalization
 
 mode = 'all'
 norm_mode = 'global_logz'
-cond_orders = None          # set to e.g. [0, -1, 1] for conditional training
+cond_orders = [0, -1, 1]          # set to e.g. [0, -1, 1] for conditional training
+dbsnr = 30                # dB SNR for measurement noise; None = no noise
+noise_model = 'Gaussian'
 results_folder = './training_results/run_all_lr_1e-4_cosine_b32'
 
 model = Unet(
@@ -31,6 +33,8 @@ config = dict(
     method = 'conditional' if cond_orders else 'unconditional',
     mode = mode,
     cond_orders = cond_orders,
+    dbsnr = dbsnr,
+    noise_model = noise_model,
     image_size = 64,
     timesteps = 1000,
     sampling_timesteps = 250,
@@ -52,6 +56,8 @@ trainer = Trainer(
     config['dataset_path'],
     mode = config['mode'],
     cond_orders = config['cond_orders'],
+    dbsnr = config['dbsnr'],
+    noise_model = config['noise_model'],
     results_folder = config['results_folder'],
     train_batch_size = config['train_batch_size'],
     train_lr = config['train_lr'],

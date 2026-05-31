@@ -18,6 +18,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 *pdf
+*txt
 # C extensions
 *.so
 *code-workspace

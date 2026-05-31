@@ -1,5 +1,5 @@
 import math, glob, json, subprocess
-from slitless.forward import Source
+from slitless.forward import Source, add_noise
 import matplotlib.pyplot as plt
 import numpy as np
 import copy
@@ -994,6 +994,8 @@ class EISDataset(Dataset):
         folder,
         mode='all',
         cond_orders=None,   # e.g. [0, -1, 1]; when set, __getitem__ returns (params, meas)
+        dbsnr=None,         # dB SNR for measurement noise; None = no noise
+        noise_model='Gaussian',
         # image_size,
         # exts = ['jpg', 'jpeg', 'png', 'tiff'],
         # augment_horizontal_flip = False,
@@ -1004,6 +1006,8 @@ class EISDataset(Dataset):
         self.paths = glob.glob(self.folder+'/data*.npy')
         self.mode = mode
         self.cond_orders = cond_orders
+        self.dbsnr = dbsnr
+        self.noise_model = noise_model
 
         # maybe_convert_fn = partial(convert_image_to_fn, convert_image_to) if exists(convert_image_to) else nn.Identity()
 
@@ -1035,6 +1039,8 @@ class EISDataset(Dataset):
 
         if self.cond_orders is not None:
             meas = np.stack([data[f'meas_{o}'] for o in self.cond_orders])
+            meas = add_noise(meas, dbsnr=self.dbsnr, no_noise=self.dbsnr is None,
+                             noise_model=self.noise_model)
             meas = torch.tensor(meas, dtype=torch.float32)
             return params, meas
 
@@ -1050,6 +1056,8 @@ class Trainer:
         *,
         mode = 'all',
         cond_orders = None,   # e.g. [0, -1, 1] for conditional training; None = unconditional
+        dbsnr = None,         # dB SNR for measurement noise; None = no noise
+        noise_model = 'Gaussian',
         train_batch_size = 16,
         gradient_accumulate_every = 1,
         train_lr = 1e-4,
@@ -1109,7 +1117,8 @@ class Trainer:
         # dataset and dataloader
 
         # self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
-        self.ds = EISDataset(folder, self.mode, cond_orders=cond_orders)
+        self.ds = EISDataset(folder, self.mode, cond_orders=cond_orders,
+                             dbsnr=dbsnr, noise_model=noise_model)
 
         assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
 

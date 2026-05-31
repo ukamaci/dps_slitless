@@ -15,7 +15,8 @@ WIDTH_TO_PIX      = 1.0 / DISPERSION_SCALE                         # Å    → p
 # ── config ────────────────────────────────────────────────────────────────────
 # run_folder  = './training_results/exp_norm_logz_dset6_lr5e-6'   # training run to load
 # run_folder  = './training_results/run_all_lr_1e-4_cosine_b32_logz'   # training run to load
-run_folder  = './training_results/run_all_lr1e-4_cosine_b32_conditional_linear'   # training run to load
+# run_folder  = './training_results/run_all_lr1e-4_cosine_b32_conditional_linear'   # training run to load
+run_folder  = './training_results/run_all_lr1e-4_cosine_b32_conditional_logz'   # training run to load
 # run_folder  = './training_results/exp_norm_persample_dset6_lr5e-6'   # training run to load
 milestone   = 10                             # model-{milestone}.pt
 rec_mode    = 'all'
@@ -108,7 +109,7 @@ if method == 'conditional':
         mode=rec_mode,
         image_size=64,
         timesteps=1000,
-        sampling_timesteps=250,
+        sampling_timesteps=1000,
         beta_schedule='cosine',
         clip_denoised=(-5., 5.),
         device=device,

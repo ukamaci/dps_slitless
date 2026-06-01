@@ -990,6 +990,10 @@ class GaussianDiffusion(Module):
 
 _DIFFRACTION_ORDERS = [0, -1, 1, -2, 2]
 
+# Fixed seed for the dsize dataset-size ablation. Shared with the slitless repo
+# so a given dsize selects the identical training subset in both codebases.
+DSIZE_SEED = 42
+
 class EISDataset(Dataset):
     def __init__(
         self,
@@ -998,6 +1002,7 @@ class EISDataset(Dataset):
         numdetectors=0,     # 0 = unconditional; >0 = conditional with _DIFFRACTION_ORDERS[:n]
         dbsnr=None,         # dB SNR for measurement noise; None = no noise
         noise_model='Gaussian',
+        dsize=1.0,          # fraction of the training set to keep (dataset-size ablation)
         # image_size,
         # exts = ['jpg', 'jpeg', 'png', 'tiff'],
         # augment_horizontal_flip = False,
@@ -1005,7 +1010,16 @@ class EISDataset(Dataset):
     ):
         super().__init__()
         self.folder = folder
-        self.paths = glob.glob(self.folder+'/data*.npy')
+        # Sort first so the file order is canonical (identical to the slitless
+        # repo's BasicDataset), then take a fixed-seed random subset. This keeps
+        # the dsize ablation reproducible AND shared across repos: both pick the
+        # same samples, and subsets are nested (quarter ⊂ half).
+        self.paths = sorted(glob.glob(self.folder+'/data*.npy'))
+        if dsize < 1.0:
+            rng = np.random.default_rng(DSIZE_SEED)
+            n_keep = round(dsize * len(self.paths))
+            keep = sorted(rng.permutation(len(self.paths))[:n_keep].tolist())
+            self.paths = [self.paths[i] for i in keep]
         self.mode = mode
         self.cond_orders = _DIFFRACTION_ORDERS[:numdetectors] if numdetectors > 0 else None
         self.dbsnr = dbsnr
@@ -1060,6 +1074,7 @@ class Trainer:
         numdetectors = 0,     # 0 = unconditional; >0 = conditional with _DIFFRACTION_ORDERS[:n]
         dbsnr = None,         # dB SNR for measurement noise; None = no noise
         noise_model = 'Gaussian',
+        dsize = 1.0,          # fraction of the training set to keep (dataset-size ablation)
         train_batch_size = 16,
         gradient_accumulate_every = 1,
         train_lr = 1e-4,
@@ -1120,7 +1135,7 @@ class Trainer:
 
         # self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
         self.ds = EISDataset(folder, self.mode, numdetectors=numdetectors,
-                             dbsnr=dbsnr, noise_model=noise_model)
+                             dbsnr=dbsnr, noise_model=noise_model, dsize=dsize)
 
         assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
 

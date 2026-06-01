@@ -1,4 +1,4 @@
-import math, glob, json, subprocess
+import math, glob, json, subprocess, os
 from slitless.forward import Source, add_noise
 import matplotlib.pyplot as plt
 import numpy as np
@@ -6,7 +6,7 @@ import copy
 from pathlib import Path
 from random import random
 from functools import partial
-from collections import namedtuple
+from collections import namedtuple, defaultdict
 from multiprocessing import cpu_count
 from datetime import datetime
 from denoising_diffusion_pytorch.plotting import plotgrid
@@ -990,9 +990,53 @@ class GaussianDiffusion(Module):
 
 _DIFFRACTION_ORDERS = [0, -1, 1, -2, 2]
 
-# Fixed seed for the dsize dataset-size ablation. Shared with the slitless repo
-# so a given dsize selects the identical training subset in both codebases.
-DSIZE_SEED = 42
+# Fixed seed for the partition (dataset-size / no-leakage) ablation. Shared with
+# the slitless repo so a given (partno, partnum) selects the identical scans in
+# both codebases.
+PARTITION_SEED = 42
+
+
+def _scan_id(path):
+    """Scan id from a 'data_<date>_<time>_<patchno>.npy' filename, i.e. the name
+    with the trailing '_<patchno>' (and '.npy') stripped. dset_v6 patches are
+    64x64 crops of larger EIS scans; grouping by scan id keeps every patch of a
+    scan in one partition (no data leakage across partitions)."""
+    return os.path.basename(path)[:-4].rsplit('_', 1)[0]
+
+
+def partition_files(files, partno, partnum, seed=PARTITION_SEED):
+    """Return the subset of `files` belonging to partition `partno` of `partnum`.
+
+    Patches are grouped by scan id so a scan never straddles two partitions.
+    Scan ids are sorted (canonical, repo/OS-independent order) then seeded-
+    shuffled — the shuffle breaks the temporal ordering encoded in the scan
+    date, spreading scan times homogeneously across partitions. Whole scans are
+    then greedily assigned to the currently-smallest partition (by patch count)
+    so partition sizes stay tightly balanced. Reproducible and identical across
+    repos given the same files, seed, partno and partnum.
+    """
+    assert isinstance(partno, int) and isinstance(partnum, int), 'partno/partnum must be ints'
+    assert partnum >= 1, f'partnum must be >= 1, got {partnum}'
+    assert 1 <= partno <= partnum, f'partno must be in 1..{partnum}, got {partno}'
+    if partnum == 1:
+        return list(files)
+
+    groups = defaultdict(list)
+    for f in files:
+        groups[_scan_id(f)].append(f)
+
+    scan_ids = sorted(groups)
+    np.random.default_rng(seed).shuffle(scan_ids)
+
+    loads = [0] * partnum
+    keep = []
+    for sid in scan_ids:
+        i = min(range(partnum), key=lambda j: loads[j])   # currently-smallest partition
+        loads[i] += len(groups[sid])
+        if i == partno - 1:
+            keep.extend(groups[sid])
+    return sorted(keep)
+
 
 class EISDataset(Dataset):
     def __init__(
@@ -1002,7 +1046,8 @@ class EISDataset(Dataset):
         numdetectors=0,     # 0 = unconditional; >0 = conditional with _DIFFRACTION_ORDERS[:n]
         dbsnr=None,         # dB SNR for measurement noise; None = no noise
         noise_model='Gaussian',
-        dsize=1.0,          # fraction of the training set to keep (dataset-size ablation)
+        partno=1,           # which partition to keep (1..partnum); dataset-size / no-leakage ablation
+        partnum=1,          # split the training set into this many leakage-free partitions
         # image_size,
         # exts = ['jpg', 'jpeg', 'png', 'tiff'],
         # augment_horizontal_flip = False,
@@ -1010,16 +1055,9 @@ class EISDataset(Dataset):
     ):
         super().__init__()
         self.folder = folder
-        # Sort first so the file order is canonical (identical to the slitless
-        # repo's BasicDataset), then take a fixed-seed random subset. This keeps
-        # the dsize ablation reproducible AND shared across repos: both pick the
-        # same samples, and subsets are nested (quarter ⊂ half).
-        self.paths = sorted(glob.glob(self.folder+'/data*.npy'))
-        if dsize < 1.0:
-            rng = np.random.default_rng(DSIZE_SEED)
-            n_keep = round(dsize * len(self.paths))
-            keep = sorted(rng.permutation(len(self.paths))[:n_keep].tolist())
-            self.paths = [self.paths[i] for i in keep]
+        # Split into partnum leakage-free partitions (whole scans never straddle
+        # partitions) and keep partition partno; partnum=1 returns the full set.
+        self.paths = partition_files(glob.glob(self.folder+'/data*.npy'), partno, partnum)
         self.mode = mode
         self.cond_orders = _DIFFRACTION_ORDERS[:numdetectors] if numdetectors > 0 else None
         self.dbsnr = dbsnr
@@ -1074,7 +1112,8 @@ class Trainer:
         numdetectors = 0,     # 0 = unconditional; >0 = conditional with _DIFFRACTION_ORDERS[:n]
         dbsnr = None,         # dB SNR for measurement noise; None = no noise
         noise_model = 'Gaussian',
-        dsize = 1.0,          # fraction of the training set to keep (dataset-size ablation)
+        partno = 1,           # which partition to keep (1..partnum); dataset-size / no-leakage ablation
+        partnum = 1,          # split the training set into this many leakage-free partitions
         train_batch_size = 16,
         gradient_accumulate_every = 1,
         train_lr = 1e-4,
@@ -1135,7 +1174,8 @@ class Trainer:
 
         # self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
         self.ds = EISDataset(folder, self.mode, numdetectors=numdetectors,
-                             dbsnr=dbsnr, noise_model=noise_model, dsize=dsize)
+                             dbsnr=dbsnr, noise_model=noise_model,
+                             partno=partno, partnum=partnum)
 
         assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
 

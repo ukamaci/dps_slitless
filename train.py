@@ -11,16 +11,17 @@ noise_model      = 'Gaussian'
 beta_schedule    = 'cosine'
 train_batch_size = 32
 train_lr         = 1e-4
-dsize            = 1.0               # fraction of the training set to keep (dataset-size ablation); 1.0 = full set
+partno           = 1                 # which partition to train on (1..partnum); dataset-size / no-leakage ablation
+partnum          = 1                 # split the training set into this many leakage-free partitions; 1 = full set
 
 method    = 'conditional' if numdetectors > 0 else 'unconditional'
 lr_str    = f"{train_lr:.0e}".replace("e-0", "e-").replace("e+0", "e+")
-dsize_str = f'_dsize_{dsize:.2f}' if dsize < 1.0 else ''
+part_str  = f'_dsize_{partno}v{partnum}' if partnum > 1 else ''
 timestamp = datetime.now().strftime('%Y_%m_%d__%H_%M_%S')
 results_folder = (
     f'./training_results/{timestamp}_{mode}_lr_{lr_str}_{beta_schedule}'
     f'_b{train_batch_size}_numdetectors_{numdetectors}_{norm_mode}'
-    f'_{method}_{noise_model}_{dbsnr}{dsize_str}'
+    f'_{method}_{noise_model}_{dbsnr}{part_str}'
 )
 
 model = Unet(
@@ -50,7 +51,8 @@ config = dict(
     numdetectors = numdetectors,
     dbsnr = dbsnr,
     noise_model = noise_model,
-    dsize = dsize,
+    partno = partno,
+    partnum = partnum,
     image_size = 64,
     timesteps = 1000,
     sampling_timesteps = 250,
@@ -74,7 +76,8 @@ trainer = Trainer(
     numdetectors = config['numdetectors'],
     dbsnr = config['dbsnr'],
     noise_model = config['noise_model'],
-    dsize = config['dsize'],
+    partno = config['partno'],
+    partnum = config['partnum'],
     results_folder = config['results_folder'],
     train_batch_size = config['train_batch_size'],
     train_lr = config['train_lr'],

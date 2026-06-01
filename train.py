@@ -6,7 +6,7 @@ from denoising_diffusion_pytorch.normalization import make_normalization
 mode             = 'all'
 norm_mode        = 'global_logz'
 numdetectors     = 3                 # 0 = unconditional; >0 = conditional with [0,-1,1,-2,2][:n]
-dbsnr            = 30                # dB SNR for measurement noise; None = no noise
+dbsnr            = 20                # dB SNR for measurement noise; None = no noise
 noise_model      = 'Gaussian'
 beta_schedule    = 'cosine'
 train_batch_size = 32

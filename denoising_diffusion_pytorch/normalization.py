@@ -9,6 +9,7 @@ _STATS = np.load(
 INT_LOG_MEAN = float(_STATS['int_log_mean'])   # 6.8979
 INT_LOG_STD  = float(_STATS['int_log_std'])    # 0.6816
 INT_MEAN     = float(_STATS['int_mean'])       # 1227.93 erg/cm²/s/sr — fallback scale for unconditional generation
+MEAS_MIN     = float(_STATS['meas_min'])       # 4.2653 DN — physical floor; clamp noisy meas here before log
 VEL_MEAN     = float(_STATS['vel_mean'])       # -1.0849 km/s
 VEL_STD      = float(_STATS['vel_std'])        # 9.0853 km/s
 WIDTH_MEAN   = float(_STATS['width_mean'])     # 0.028477 Å
@@ -50,12 +51,18 @@ class GlobalLogzNorm:
         return x
 
     def normalize_cond(self, cond):
-        """Normalize conditioning measurements (intensity-like DN) → log-zscore.
+        """Normalize conditioning measurements (DN) → log-zscore.
 
-        Measurements share the intensity channel's transform (same physical quantity).
+        Uses the intensity stats int_log_mean/std: meas_0 is the noisy intensity,
+        so this lands the conditioning in the same frame as the intensity target
+        channel (meas_log_* differs <1%, so this is also ~consistent with slitless
+        meas_transform). Noisy measurements can dip below the physical floor
+        (clean meas_min≈4.27) and even below -1, which would make log(cond+1) NaN
+        — clamp to MEAS_MIN first. The clamp is a no-op at high SNR / noiseless
+        (clean meas ≥ meas_min), so it's compatible with models trained without it.
         cond: (B, n_cond, H, W) raw DN.
         """
-        return (_log(cond) - INT_LOG_MEAN) / INT_LOG_STD
+        return (_log(cond.clamp(min=MEAS_MIN)) - INT_LOG_MEAN) / INT_LOG_STD
 
     def inverse(self, x):
         """Normalized → physical (B, C, H, W)."""

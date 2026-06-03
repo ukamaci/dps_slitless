@@ -1117,11 +1117,12 @@ class Trainer:
         train_batch_size = 16,
         gradient_accumulate_every = 1,
         train_lr = 1e-4,
-        train_num_steps = 100000,
+        train_num_epochs = 100,        # total epochs (passes over the dataset)
         ema_update_every = 10,
         ema_decay = 0.995,
         adam_betas = (0.9, 0.99),
-        save_and_sample_every = 1000,
+        save_every = None,             # save a checkpoint every N epochs; None = save only the final model
+        sample_every = 10,             # generate a sample grid every N epochs; None = no periodic sampling
         num_samples = 25,
         results_folder = './results2',
         amp = False,
@@ -1159,13 +1160,15 @@ class Trainer:
         # sampling and training hyperparameters
 
         self.num_samples = num_samples
-        self.save_and_sample_every = save_and_sample_every
+        # epoch-based cadences (converted to steps below, once the dataset size is known)
+        self.train_num_epochs = train_num_epochs
+        self.save_every = save_every        # in epochs; None => save only the final model
+        self.sample_every = sample_every    # in epochs; None => no periodic sampling
 
         self.batch_size = train_batch_size
         self.gradient_accumulate_every = gradient_accumulate_every
         assert (train_batch_size * gradient_accumulate_every) >= 16, f'your effective batch size (train_batch_size x gradient_accumulate_every) should be at least 16 or above'
 
-        self.train_num_steps = train_num_steps
         self.image_size = diffusion_model.image_size
 
         self.max_grad_norm = max_grad_norm
@@ -1178,6 +1181,17 @@ class Trainer:
                              partno=partno, partnum=partnum)
 
         assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
+
+        # ── epoch ↔ step conversion ──────────────────────────────────────────
+        # One optimizer step consumes batch_size * gradient_accumulate_every
+        # samples, so an epoch (one pass over the dataset) is that many fewer
+        # steps. All step-based cadences are derived from the epoch inputs here,
+        # so the same epoch counts give the same #passes per image regardless of
+        # dataset (partition) size.
+        self.steps_per_epoch   = math.ceil(len(self.ds) / (self.batch_size * self.gradient_accumulate_every))
+        self.train_num_steps   = self.train_num_epochs * self.steps_per_epoch
+        self.save_every_steps   = self.save_every   * self.steps_per_epoch if self.save_every   is not None else None
+        self.sample_every_steps = self.sample_every * self.steps_per_epoch if self.sample_every is not None else None
 
         # store a fixed validation cond batch for periodic conditional sampling
         if numdetectors > 0:
@@ -1356,11 +1370,12 @@ class Trainer:
                     if accelerator.is_main_process:
                         self.ema.update()
 
-                        if self.step != 0 and divisible_by(self.step, self.save_and_sample_every):
+                        # ── periodic sampling (every sample_every epochs) ──
+                        if self.sample_every_steps is not None and divisible_by(self.step, self.sample_every_steps):
                             self.ema.ema_model.eval()
 
                             with torch.inference_mode():
-                                milestone = self.step // self.save_and_sample_every
+                                milestone = self.step // self.sample_every_steps
                                 batches = num_to_groups(self.num_samples, self.batch_size)
                                 if self.val_cond is not None:
                                     val_cond_dev = self.val_cond.to(self.device)
@@ -1379,20 +1394,27 @@ class Trainer:
                             # utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow = int(math.sqrt(self.num_samples)))
 
                             # whether to calculate fid
-
                             if self.calculate_fid:
                                 fid_score = self.fid_scorer.fid_score()
                                 accelerator.print(f'fid_score: {fid_score}')
+                                if self.save_best_and_latest_only:
+                                    if self.best_fid > fid_score:
+                                        self.best_fid = fid_score
+                                        self.save("best")
+                                    self.save("latest")
 
-                            if self.save_best_and_latest_only:
-                                if self.best_fid > fid_score:
-                                    self.best_fid = fid_score
-                                    self.save("best")
-                                self.save("latest")
-                            else:
-                                self.save(milestone)
+                        # ── periodic checkpoint (every save_every epochs; None => final only) ──
+                        if not self.save_best_and_latest_only and self.save_every_steps is not None \
+                                and divisible_by(self.step, self.save_every_steps):
+                            self.save(self.step // self.save_every_steps)
 
                     pbar.update(1)
+
+            # when save_every is None we save nothing periodically; persist the
+            # final model here as the single checkpoint for the run.
+            if accelerator.is_main_process and self.save_every_steps is None \
+                    and not self.save_best_and_latest_only:
+                self.save('final')
 
             accelerator.print('training complete')
         finally:

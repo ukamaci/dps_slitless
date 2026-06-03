@@ -6,7 +6,7 @@ from denoising_diffusion_pytorch.normalization import make_normalization
 mode             = 'all'
 norm_mode        = 'global_logz'
 numdetectors     = 3                 # 0 = unconditional; >0 = conditional with [0,-1,1,-2,2][:n]
-dbsnr            = 20                # dB SNR for measurement noise; None = no noise
+dbsnr            = 30                # dB SNR for measurement noise; None = no noise
 noise_model      = 'Gaussian'
 beta_schedule    = 'cosine'
 train_batch_size = 32
@@ -60,9 +60,10 @@ config = dict(
     train_batch_size = train_batch_size,
     gradient_accumulate_every = 2,
     train_lr = train_lr,
-    train_num_steps = 50000,
+    train_num_epochs = 140,
     ema_decay = 0.995,
-    save_and_sample_every = 5000,
+    save_every = None,          # epochs between checkpoints; None = save only the final model
+    sample_every = 14,          # epochs between sample grids
     dataset_path = '/home/kamo/resources/slitless/data/eis_data/datasets/dset_v6/data/train',
     norm_mode = norm_mode,
     clip_denoised = (-5., 5.),
@@ -81,10 +82,11 @@ trainer = Trainer(
     results_folder = config['results_folder'],
     train_batch_size = config['train_batch_size'],
     train_lr = config['train_lr'],
-    train_num_steps = config['train_num_steps'],
+    train_num_epochs = config['train_num_epochs'],
     gradient_accumulate_every = config['gradient_accumulate_every'],
     ema_decay = config['ema_decay'],
-    save_and_sample_every = config['save_and_sample_every'],
+    save_every = config['save_every'],
+    sample_every = config['sample_every'],
     num_samples = 8,
     amp = True,
     calculate_fid = False,

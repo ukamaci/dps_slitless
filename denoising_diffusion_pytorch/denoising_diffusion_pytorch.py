@@ -750,10 +750,14 @@ class GaussianDiffusion(Module):
         return norm_grad, norm
 
     # @torch.inference_mode()
-    def p_sample_loop(self, shape, return_all_timesteps = False, cond = None):
+    def p_sample_loop(self, shape, return_all_timesteps = False, cond = None, noise = None):
         batch, device = shape[0], self.device
 
-        if self.recon:
+        if noise is not None:
+            img = noise.to(device).clone()
+            if self.recon:
+                img = img.requires_grad_(True)
+        elif self.recon:
             img = torch.randn(shape, device = device, requires_grad = True)
         else:
             img = torch.randn(shape, device = device, requires_grad = False)
@@ -808,14 +812,18 @@ class GaussianDiffusion(Module):
             return ret
 
     # @torch.inference_mode()
-    def ddim_sample(self, shape, return_all_timesteps = False, cond = None):
+    def ddim_sample(self, shape, return_all_timesteps = False, cond = None, noise = None):
         batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
         times = torch.linspace(-1, total_timesteps - 1, steps = sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
         times = list(reversed(times.int().tolist()))
         time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
 
-        if self.recon:
+        if noise is not None:
+            img = noise.to(device).clone()
+            if self.recon:
+                img = img.requires_grad_(True)
+        elif self.recon:
             img = torch.randn(shape, device = device, requires_grad = True)
         else:
             img = torch.randn(shape, device = device)
@@ -882,12 +890,12 @@ class GaussianDiffusion(Module):
             return ret
 
     # @torch.inference_mode()
-    def sample(self, batch_size = 16, return_all_timesteps = False, cond = None):
+    def sample(self, batch_size = 16, return_all_timesteps = False, cond = None, noise = None):
         (h, w), channels = self.image_size, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
         if cond is not None:
             cond = self.normalization.normalize_cond(cond)   # match training; uses meas[:,0] as intensity scale
-        return sample_fn((batch_size, channels, h, w), return_all_timesteps = return_all_timesteps, cond = cond)
+        return sample_fn((batch_size, channels, h, w), return_all_timesteps = return_all_timesteps, cond = cond, noise = noise)
 
     @torch.inference_mode()
     def interpolate(self, x1, x2, t = None, lam = 0.5):
@@ -1241,6 +1249,15 @@ class Trainer:
         self.periodic_samples_folder = self.results_folder / 'periodic_samples'
         self.periodic_samples_folder.mkdir(parents = True, exist_ok = True)
 
+        # fixed noise for periodic sampling — same seed every checkpoint so the
+        # generated images track model improvement rather than noise variation
+        h, w = diffusion_model.image_size
+        gen = torch.Generator()
+        gen.manual_seed(0)
+        self.fixed_sample_noise = torch.randn(
+            num_samples, diffusion_model.channels, h, w, generator=gen
+        )  # stored on CPU; moved to device at sample time
+
         # step counter state
 
         self.step = 0
@@ -1402,10 +1419,15 @@ class Trainer:
                                     val_cond_dev = self.val_cond.to(self.device)
                                     offset, all_images_list = 0, []
                                     for n in batches:
-                                        all_images_list.append(self.ema.ema_model.sample(batch_size=n, cond=val_cond_dev[offset:offset+n]))
+                                        noise_batch = self.fixed_sample_noise[offset:offset+n]
+                                        all_images_list.append(self.ema.ema_model.sample(batch_size=n, cond=val_cond_dev[offset:offset+n], noise=noise_batch))
                                         offset += n
                                 else:
-                                    all_images_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
+                                    offset, all_images_list = 0, []
+                                    for n in batches:
+                                        noise_batch = self.fixed_sample_noise[offset:offset+n]
+                                        all_images_list.append(self.ema.ema_model.sample(batch_size=n, noise=noise_batch))
+                                        offset += n
 
                             all_images = torch.cat(all_images_list, dim = 0)
 

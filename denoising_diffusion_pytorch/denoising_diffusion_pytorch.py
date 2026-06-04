@@ -1118,11 +1118,18 @@ class Trainer:
         gradient_accumulate_every = 1,
         train_lr = 1e-4,
         train_num_epochs = 100,        # total epochs (passes over the dataset)
+        train_num_steps = None,        # total optimizer steps; overrides train_num_epochs when set
+                                       # (use to match COMPUTE across dataset sizes, vs train_num_epochs
+                                       #  which matches PASSES-PER-IMAGE and so undertrains small sets)
         ema_update_every = 10,
         ema_decay = 0.995,
         adam_betas = (0.9, 0.99),
         save_every = None,             # save a checkpoint every N epochs; None = save only the final model
         sample_every = 10,             # generate a sample grid every N epochs; None = no periodic sampling
+        save_every_steps = None,       # checkpoint cadence in STEPS; overrides save_every (epochs) when set
+        sample_every_steps = None,     # sample-grid cadence in STEPS; overrides sample_every (epochs) when set
+                                       # (use the *_steps form with train_num_steps so cadence is in real
+                                       #  steps regardless of dataset size; the epoch form scales with N)
         num_samples = 25,
         results_folder = './results2',
         amp = False,
@@ -1162,6 +1169,7 @@ class Trainer:
         self.num_samples = num_samples
         # epoch-based cadences (converted to steps below, once the dataset size is known)
         self.train_num_epochs = train_num_epochs
+        self.train_num_steps_override = train_num_steps   # if set, total steps directly; else from epochs
         self.save_every = save_every        # in epochs; None => save only the final model
         self.sample_every = sample_every    # in epochs; None => no periodic sampling
 
@@ -1180,18 +1188,31 @@ class Trainer:
                              dbsnr=dbsnr, noise_model=noise_model,
                              partno=partno, partnum=partnum)
 
-        assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
+        # Lower bound relaxed from 100 to 8 to support the memorization→generalization
+        # ablation (experiments/generalization_memorization), which intentionally
+        # trains on very small partitions (down to ~15 images). 8 still catches an
+        # empty/degenerate folder while allowing the smallest partitions.
+        assert len(self.ds) >= 8, 'you should have at least 8 images in your folder. at least 10k images recommended'
 
         # ── epoch ↔ step conversion ──────────────────────────────────────────
         # One optimizer step consumes batch_size * gradient_accumulate_every
         # samples, so an epoch (one pass over the dataset) is that many fewer
-        # steps. All step-based cadences are derived from the epoch inputs here,
-        # so the same epoch counts give the same #passes per image regardless of
-        # dataset (partition) size.
+        # steps. The save/sample cadences are always epoch-based (derived here).
+        # The total training length is either given directly in steps
+        # (train_num_steps, to match compute across dataset sizes) or in epochs
+        # (train_num_epochs, to match passes-per-image — which undertrains small
+        # partitions since steps then scale with dataset size).
         self.steps_per_epoch   = math.ceil(len(self.ds) / (self.batch_size * self.gradient_accumulate_every))
-        self.train_num_steps   = self.train_num_epochs * self.steps_per_epoch
-        self.save_every_steps   = self.save_every   * self.steps_per_epoch if self.save_every   is not None else None
-        self.sample_every_steps = self.sample_every * self.steps_per_epoch if self.sample_every is not None else None
+        if self.train_num_steps_override is not None:
+            self.train_num_steps = int(self.train_num_steps_override)
+        else:
+            assert self.train_num_epochs is not None, 'pass train_num_epochs or train_num_steps'
+            self.train_num_steps = self.train_num_epochs * self.steps_per_epoch
+        # save/sample cadence: explicit *_steps wins; else derive from the epoch form.
+        self.save_every_steps = save_every_steps if save_every_steps is not None else (
+            self.save_every * self.steps_per_epoch if self.save_every is not None else None)
+        self.sample_every_steps = sample_every_steps if sample_every_steps is not None else (
+            self.sample_every * self.steps_per_epoch if self.sample_every is not None else None)
 
         # store a fixed validation cond batch for periodic conditional sampling
         if numdetectors > 0:

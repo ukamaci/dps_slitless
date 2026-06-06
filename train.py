@@ -14,11 +14,12 @@ train_batch_size = 32
 train_lr         = 1e-4
 partno           = 1                 # which partition to train on (1..partnum)
 partnum          = 1                 # leakage-free partitions; 1 = full dataset
-train_num_epochs = 140               # total epochs (passes over data); ignored when --steps is set
-train_num_steps  = None              # total optimizer steps; overrides epochs (use for matched-compute sweeps)
+train_num_epochs = None               # total epochs (passes over data); ignored when --steps is set
+train_num_steps  = 100000              # total optimizer steps; overrides epochs (use for matched-compute sweeps)
 save_every       = None              # checkpoint every N epochs; None = final only
+save_every_steps = 2500              # checkpoint every N steps; overrides save_every when set
 sample_every     = 14                # sample grid every N epochs
-sample_every_steps = None            # sample grid every N steps; overrides sample_every when set
+sample_every_steps = 2500            # sample grid every N steps; overrides sample_every when set
 # ─────────────────────────────────────────────────────────────────────────────
 
 parser = argparse.ArgumentParser(description='Train EIS DDPM', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -27,6 +28,7 @@ parser.add_argument('--partnum',            type=int,   default=partnum)
 parser.add_argument('--epochs',             type=int,   default=train_num_epochs,  dest='train_num_epochs')
 parser.add_argument('--steps',              type=int,   default=train_num_steps,   dest='train_num_steps')
 parser.add_argument('--save-every',         type=int,   default=save_every,        dest='save_every')
+parser.add_argument('--save-every-steps',   type=int,   default=save_every_steps,  dest='save_every_steps')
 parser.add_argument('--sample-every',       type=int,   default=sample_every,      dest='sample_every')
 parser.add_argument('--sample-every-steps', type=int,   default=sample_every_steps,dest='sample_every_steps')
 parser.add_argument('--lr',                 type=float, default=train_lr,          dest='train_lr')
@@ -41,6 +43,7 @@ partnum            = args.partnum
 train_num_epochs   = args.train_num_epochs
 train_num_steps    = args.train_num_steps
 save_every         = args.save_every
+save_every_steps   = args.save_every_steps
 sample_every       = args.sample_every
 sample_every_steps = args.sample_every_steps
 train_lr           = args.train_lr
@@ -98,6 +101,7 @@ config = dict(
     train_num_steps = train_num_steps,
     ema_decay = 0.995,
     save_every = save_every,
+    save_every_steps = save_every_steps,
     sample_every = sample_every,
     sample_every_steps = sample_every_steps,
     dataset_path = '/home/kamo/resources/slitless/data/eis_data/datasets/dset_v6/data/train',
@@ -123,6 +127,7 @@ trainer = Trainer(
     gradient_accumulate_every = config['gradient_accumulate_every'],
     ema_decay = config['ema_decay'],
     save_every = config['save_every'],
+    save_every_steps = config['save_every_steps'],
     sample_every = config['sample_every'],
     sample_every_steps = config['sample_every_steps'],
     num_samples = 8,

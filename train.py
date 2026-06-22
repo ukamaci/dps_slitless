@@ -18,7 +18,7 @@ train_num_epochs = None               # total epochs (passes over data); ignored
 train_num_steps  = 100000              # total optimizer steps; overrides epochs (use for matched-compute sweeps)
 save_every       = None              # checkpoint every N epochs; None = final only
 save_every_steps = 2500              # checkpoint every N steps; overrides save_every when set
-sample_every     = 14                # sample grid every N epochs
+sample_every     = None                # sample grid every N epochs
 sample_every_steps = 2500            # sample grid every N steps; overrides sample_every when set
 # ─────────────────────────────────────────────────────────────────────────────
 

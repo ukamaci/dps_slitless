@@ -76,7 +76,7 @@ def build_diffusion(run_folder, milestone, norm_mode, meas_np, true_np):
         measurement=meas_t,
         true=true_t,
         beta_schedule='cosine',
-        clip_denoised=(-5., 5.),
+        clip_denoised=normalization.clip_denoised,   # mode-aware (matches train)
         grad_scale=torch.tensor([GRAD_SCALE]).to(device),
         forward_op=forward_op,
         device=device,

@@ -9,11 +9,23 @@ _STATS = np.load(
 INT_LOG_MEAN = float(_STATS['int_log_mean'])   # 6.8979
 INT_LOG_STD  = float(_STATS['int_log_std'])    # 0.6816
 INT_MEAN     = float(_STATS['int_mean'])       # 1227.93 erg/cm²/s/sr — fallback scale for unconditional generation
+INT_MIN      = float(_STATS['int_min'])        # 4.2653 erg/cm²/s/sr — global intensity range for linear [-1,1]
+INT_MAX      = float(_STATS['int_max'])         # 7986.07
+INT_P001     = float(_STATS['int_p001'])       # 124.69 — 0.1/99.9 percentile range (outlier-robust linear [-1,1])
+INT_P999     = float(_STATS['int_p999'])        # 5490.82
 MEAS_MIN     = float(_STATS['meas_min'])       # 4.2653 DN — physical floor; clamp noisy meas here before log
 VEL_MEAN     = float(_STATS['vel_mean'])       # -1.0849 km/s
 VEL_STD      = float(_STATS['vel_std'])        # 9.0853 km/s
+VEL_MIN      = float(_STATS['vel_min'])        # -61.674 km/s — global velocity range for linear [-1,1]
+VEL_MAX      = float(_STATS['vel_max'])         # 51.965 km/s
+VEL_P001     = float(_STATS['vel_p001'])       # -40.258 km/s — 0.1/99.9 percentile range
+VEL_P999     = float(_STATS['vel_p999'])        # 23.016 km/s
 WIDTH_MEAN   = float(_STATS['width_mean'])     # 0.028477 Å
 WIDTH_STD    = float(_STATS['width_std'])      # 0.001394 Å
+WIDTH_MIN    = float(_STATS['width_min'])      # 0.019108 Å — global width range for linear [-1,1]
+WIDTH_MAX    = float(_STATS['width_max'])        # 0.050955 Å
+WIDTH_P001   = float(_STATS['width_p001'])     # 0.024428 Å — 0.1/99.9 percentile range
+WIDTH_P999   = float(_STATS['width_p999'])      # 0.036964 Å
 LOG_EPS      = float(_STATS['log_eps'])        # 1.0
 
 
@@ -31,6 +43,11 @@ class GlobalLogzNorm:
     All stats derived from dset_v6 training set.
     """
     name = 'global_logz'
+    # x_start clip range during sampling, in this scheme's normalized space.
+    # Z-scored channels span several stds, so a wide clip avoids truncating tails.
+    clip_denoised = (-5., 5.)
+    # std of log-intensity: the per-unit-normalized-space intensity scale (analogous to 1/a_int for linear)
+    intensity_slope = INT_LOG_STD
 
     def __init__(self, rec_mode='all'):
         self.rec_mode = rec_mode
@@ -87,6 +104,11 @@ class PersampleLinearNorm:
     with an estimate (e.g. meas[:, 0].max()) before running the sampling loop.
     """
     name = 'persample_linear'
+    # Intensity is in [-1,1] but vel/width stay z-scored (several stds), so keep
+    # a wide clip to avoid truncating those channels.
+    clip_denoised = (-5., 5.)
+    # Fixed approximation: dataset-mean intensity / 2 (the per-sample slope is unknown at class level)
+    intensity_slope = INT_MEAN / 2.0
 
     def __init__(self, rec_mode='all'):
         self.rec_mode = rec_mode
@@ -155,9 +177,95 @@ class PersampleLinearNorm:
         return x
 
 
+class GlobalLinearNorm:
+    """Global fixed-range linear map of all three channels to [-1, 1].
+
+    Each channel is mapped with its global training min/max:
+        x -> 2*(x - min)/(max - min) - 1
+    Unlike PersampleLinearNorm (per-sample intensity scale, z-scored vel/width),
+    every channel uses a fixed dataset-wide range, so the scale is identical
+    across samples and no per-sample state is needed. Operates in physical units
+    (intensity erg/cm²/s/sr, velocity km/s, width Å); raw intensity (no log).
+    All ranges derived from dset_v6 training set.
+    """
+    name = 'global_linear'
+    # All channels are bounded to [-1,1], so clip x_start to the valid data range.
+    clip_denoised = (-1., 1.)
+
+    _RANGES = {0: (INT_MIN, INT_MAX), 1: (VEL_MIN, VEL_MAX), 2: (WIDTH_MIN, WIDTH_MAX)}
+
+    def __init__(self, rec_mode='all'):
+        self.rec_mode = rec_mode
+        lo, hi = self._RANGES[0]
+        self.intensity_slope = (hi - lo) / 2.0
+
+    @staticmethod
+    def _fwd(x, lo, hi):
+        return 2 * (x - lo) / (hi - lo) - 1
+
+    @staticmethod
+    def _inv(x, lo, hi):
+        return (x + 1) / 2 * (hi - lo) + lo
+
+    def _channels(self):
+        """Map output channel index -> physical channel index for the rec_mode."""
+        if self.rec_mode == 'all':
+            return {0: 0, 1: 1, 2: 2}
+        return {0: {'int': 0, 'vel': 1, 'width': 2}[self.rec_mode]}
+
+    def forward(self, x):
+        """Physical (B, C, H, W) → normalized [-1, 1]."""
+        x = x.clone()
+        for out_c, phys_c in self._channels().items():
+            lo, hi = self._RANGES[phys_c]
+            x[:, out_c] = self._fwd(x[:, out_c], lo, hi)
+        return x
+
+    def normalize_cond(self, cond):
+        """Normalize conditioning measurements (DN) → [-1, 1].
+
+        Measurements are intensity-like (DN), so they share the intensity
+        channel's global range. Noisy measurements can dip below the physical
+        floor (clean meas_min≈4.27), so clamp to MEAS_MIN first; the clamp is a
+        no-op at high SNR / noiseless. cond: (B, n_cond, H, W) raw DN.
+        """
+        return self._fwd(cond.clamp(min=MEAS_MIN), INT_MIN, INT_MAX)
+
+    def inverse(self, x):
+        """Normalized [-1, 1] → physical (B, C, H, W)."""
+        x = x.clone()
+        for out_c, phys_c in self._channels().items():
+            lo, hi = self._RANGES[phys_c]
+            x[:, out_c] = self._inv(x[:, out_c], lo, hi)
+        return x
+
+
+class GlobalLinearPctNorm(GlobalLinearNorm):
+    """Like GlobalLinearNorm but uses outlier-robust 0.1/99.9 percentile ranges.
+
+    The bulk of each channel fills [-1, 1] more fully than with true min/max
+    (whose extreme tails otherwise compress the bulk). The ~0.2% of values
+    outside the percentile range map beyond [-1, 1], so forward() clamps to
+    [-1, 1]; inverse() of a clamped value returns the percentile bound, not the
+    original outlier (expected for percentile normalization). All ranges from
+    the dset_v6 training set.
+    """
+    name = 'global_linear_pct'
+
+    _RANGES = {0: (INT_P001, INT_P999), 1: (VEL_P001, VEL_P999), 2: (WIDTH_P001, WIDTH_P999)}
+
+    def forward(self, x):
+        return super().forward(x).clamp(-1, 1)
+
+    def normalize_cond(self, cond):
+        return self._fwd(cond.clamp(min=MEAS_MIN), INT_P001, INT_P999).clamp(-1, 1)
+
+
 _REGISTRY = {
     'global_logz': GlobalLogzNorm,
     'persample_linear': PersampleLinearNorm,
+    'global_linear': GlobalLinearNorm,
+    'global_linear_pct': GlobalLinearPctNorm,
 }
 
 

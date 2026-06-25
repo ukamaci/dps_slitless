@@ -48,6 +48,7 @@ with open(f'{RUN_FOLDER}/config.json') as f:
     _cfg = json.load(f)
     NORM_MODE  = _cfg['norm_mode']
     SAVE_EVERY = _cfg.get('save_and_sample_every', 1000)
+    CLIP_DENOISED = _cfg.get('clip_denoised')   # None for runs pre-dating this key
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -130,6 +131,7 @@ print(f'EIS: int={means_eis[0]:.1f}±{stds_eis[0]:.1f} erg/cm²/s/sr  '
 model = Unet(channels=3, dim=64, dim_mults=(1, 2, 4, 8), flash_attn=True).to(device)
 
 normalization = make_normalization(NORM_MODE, rec_mode='all')
+clip_denoised = tuple(CLIP_DENOISED) if CLIP_DENOISED is not None else normalization.clip_denoised
 diffusion = GaussianDiffusion(
     model,
     mode               = 'all',
@@ -137,7 +139,7 @@ diffusion = GaussianDiffusion(
     timesteps          = 1000,
     sampling_timesteps = 250,
     beta_schedule      = 'cosine',
-    clip_denoised      = (-5., 5.),
+    clip_denoised      = clip_denoised,
     normalization      = normalization,
     device             = device,
 )

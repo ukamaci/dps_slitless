@@ -5,9 +5,9 @@ from denoising_diffusion_pytorch.normalization import make_normalization
 
 # ── config (defaults — override any value via CLI args) ───────────────────────
 mode             = 'all'
-norm_mode        = 'global_logz'
+norm_mode        = 'global_linear'
 numdetectors     = 0                 # 0 = unconditional; >0 = conditional with [0,-1,1,-2,2][:n]
-dbsnr            = 30                # dB SNR for measurement noise; None = no noise
+dbsnr            = 20                # dB SNR for measurement noise; None = no noise
 noise_model      = 'Gaussian'
 beta_schedule    = 'cosine'
 train_batch_size = 32
@@ -15,7 +15,7 @@ train_lr         = 1e-4
 partno           = 1                 # which partition to train on (1..partnum)
 partnum          = 1                 # leakage-free partitions; 1 = full dataset
 train_num_epochs = None               # total epochs (passes over data); ignored when --steps is set
-train_num_steps  = 100000              # total optimizer steps; overrides epochs (use for matched-compute sweeps)
+train_num_steps  = 12500              # total optimizer steps; overrides epochs (use for matched-compute sweeps)
 save_every       = None              # checkpoint every N epochs; None = final only
 save_every_steps = 2500              # checkpoint every N steps; overrides save_every when set
 sample_every     = None                # sample grid every N epochs
@@ -34,6 +34,7 @@ parser.add_argument('--sample-every-steps', type=int,   default=sample_every_ste
 parser.add_argument('--lr',                 type=float, default=train_lr,          dest='train_lr')
 parser.add_argument('--dbsnr',              type=float, default=dbsnr)
 parser.add_argument('--numdetectors',       type=int,   default=numdetectors)
+parser.add_argument('--norm-mode',          type=str,   default=norm_mode,         dest='norm_mode')
 parser.add_argument('--tag',                type=str,   default='',                help='extra suffix appended to the run folder name')
 args = parser.parse_args()
 
@@ -49,16 +50,19 @@ sample_every_steps = args.sample_every_steps
 train_lr           = args.train_lr
 dbsnr              = args.dbsnr
 numdetectors       = args.numdetectors
+norm_mode          = args.norm_mode
 
 method   = 'conditional' if numdetectors > 0 else 'unconditional'
 lr_str   = f"{train_lr:.0e}".replace("e-0", "e-").replace("e+0", "e+")
 part_str = f'_dsize_{partno}v{partnum}' if partnum > 1 else ''
 tag_str  = f'_{args.tag}' if args.tag else ''
+# numdetectors/noise_model/dbsnr only affect conditioning, which is unused for
+# unconditional runs — omit them from the name to avoid implying they matter.
+cond_str = f'_numdetectors_{numdetectors}_{noise_model}_{dbsnr}' if method == 'conditional' else ''
 timestamp = datetime.now().strftime('%Y_%m_%d__%H_%M_%S')
 results_folder = (
     f'./training_results/{timestamp}_{mode}_lr_{lr_str}_{beta_schedule}'
-    f'_b{train_batch_size}_numdetectors_{numdetectors}_{norm_mode}'
-    f'_{method}_{noise_model}_{dbsnr}{part_str}{tag_str}'
+    f'_b{train_batch_size}_{norm_mode}_{method}{cond_str}{part_str}{tag_str}'
 )
 
 model = Unet(
@@ -70,6 +74,7 @@ model = Unet(
 )
 
 normalization = make_normalization(norm_mode, rec_mode=mode)
+clip_denoised = normalization.clip_denoised   # mode-aware: tight for linear [-1,1], wide for z-scored
 
 diffusion = GaussianDiffusion(
     model,
@@ -78,7 +83,7 @@ diffusion = GaussianDiffusion(
     timesteps = 1000,
     sampling_timesteps = 250,
     beta_schedule = beta_schedule,
-    clip_denoised = (-5., 5.),
+    clip_denoised = clip_denoised,
     normalization = normalization,
 )
 
@@ -106,7 +111,7 @@ config = dict(
     sample_every_steps = sample_every_steps,
     dataset_path = '/home/kamo/resources/slitless/data/eis_data/datasets/dset_v6/data/train',
     norm_mode = norm_mode,
-    clip_denoised = (-5., 5.),
+    clip_denoised = clip_denoised,
     results_folder = results_folder,
 )
 

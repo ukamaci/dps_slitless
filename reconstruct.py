@@ -14,18 +14,19 @@ WIDTH_TO_PIX      = 1.0 / DISPERSION_SCALE                         # Å    → p
 
 # ── config ────────────────────────────────────────────────────────────────────
 # run_folder  = './training_results/exp_norm_logz_dset6_lr5e-6'   # training run to load
-# run_folder  = './training_results/run_all_lr_1e-4_cosine_b32_logz'   # training run to load
-# run_folder  = './training_results/run_all_lr1e-4_cosine_b32_conditional_linear'   # training run to load
-run_folder  = './training_results/run_all_lr1e-4_cosine_b32_conditional_logz'   # training run to load
+# run_folder  = './training_results/run_all_lr_1e-4_cosine_b32_logz'
+# run_folder  = './training_results/2026_06_23__15_52_06_all_lr_1e-4_cosine_b32_global_linear_unconditional'   # training run to load
+run_folder  = './training_results/2026_06_23__18_18_11_all_lr_1e-4_cosine_b32_global_linear_pct_unconditional'   # training run to load
 # run_folder  = './training_results/exp_norm_persample_dset6_lr5e-6'   # training run to load
-milestone   = 10                             # model-{milestone}.pt
-rec_mode    = 'all'
-sample_idx  = 10                              # which dset_v6 test sample to reconstruct
-numdetectors = 3
-num_samples  = 10
+milestone      = 5                             # model-{milestone}.pt
+rec_mode       = 'all'
+sample_idx     = 10                              # which dset_v6 test sample to reconstruct
+numdetectors   = 0
+num_samples    = 10
+grad_norm_mode = 'int_slope'   # 'meas_rms' | 'int_slope' | 'none'
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-DATA_DIR = '/home/kamo/resources/slitless/data/eis_data/datasets/dset_v6/data/test'
+DATA_DIR = '/home/kamo/resources/slitless/data/eis_data/datasets/dset_v6/data/val'
 
 # ── load normalization from run config ────────────────────────────────────────
 config_path = f'{run_folder}/config.json'
@@ -38,6 +39,9 @@ except FileNotFoundError:
     norm_mode = 'global_logz'   # default for runs pre-dating config.json
 
 normalization = make_normalization(norm_mode, rec_mode=rec_mode)
+# Mode-aware x_start clip; prefer the value saved at train time, fall back to the
+# normalization's default for runs pre-dating clip_denoised in config.json.
+clip_denoised = tuple(run_config.get('clip_denoised', normalization.clip_denoised))
 method       = run_config.get('method', 'dps')
 numdetectors = run_config.get('numdetectors', numdetectors)
 
@@ -45,7 +49,7 @@ numdetectors = run_config.get('numdetectors', numdetectors)
 test_files = sorted(glob.glob(DATA_DIR + '/data*.npy'))
 d = np.load(test_files[sample_idx], allow_pickle=True).item()
 
-orders = [0, -1, 1, -2, 2][:numdetectors]
+orders = [0, -1, 1]
 meas_np = np.stack([d[f'meas_{o}'] for o in orders])[None].astype(np.float32)  # (1,K,H,W)
 
 if rec_mode == 'int':
@@ -110,7 +114,7 @@ if method == 'conditional':
         timesteps=1000,
         sampling_timesteps=1000,
         beta_schedule='cosine',
-        clip_denoised=(-5., 5.),
+        clip_denoised=clip_denoised,
         device=device,
         normalization=normalization,
     )
@@ -132,8 +136,11 @@ else:
         measurement=meas,
         true=true,
         beta_schedule='cosine',
-        clip_denoised=(-5., 5.),
-        grad_scale=torch.tensor([0.5]).to(device),
+        clip_denoised=clip_denoised,
+        # grad_scale=torch.tensor([0.5]).to(device),
+        # grad_scale = torch.tensor([0.10, 0.08, 0.044]).to(device),   # [int, vel, width], global_linear
+        grad_scale = torch.tensor([1, 0.1, 0.3]).to(device),   # [int, vel, width], global_linear
+        grad_norm_mode=grad_norm_mode,
         forward_op=forward_op,
         device=device,
         normalization=normalization,

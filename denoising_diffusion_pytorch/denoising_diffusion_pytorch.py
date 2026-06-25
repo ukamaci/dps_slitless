@@ -513,6 +513,7 @@ class GaussianDiffusion(Module):
         recon = False,
         measurement = None,
         grad_scale = 1.,
+        grad_norm_mode = 'meas_rms',
         forward_op=None,
         true = None,
         sampling_timesteps = None,
@@ -545,8 +546,8 @@ class GaussianDiffusion(Module):
         if recon:
             self.measurement = measurement
             self.grad_scale = grad_scale
+            self.grad_norm_mode = grad_norm_mode
             self.forward_op = forward_op
-            self.meas_scale = measurement.pow(2).mean().sqrt().item() if measurement is not None else 1.0
 
         if isinstance(image_size, int):
             image_size = (image_size, image_size)
@@ -648,6 +649,14 @@ class GaussianDiffusion(Module):
         self.unnormalize = normalization.inverse
         if recon:
             self.measurement = self.measurement.to(self.device)
+            if grad_norm_mode == 'meas_rms':
+                self.meas_scale = self.measurement.pow(2).mean().sqrt().item()
+            elif grad_norm_mode == 'int_slope':
+                self.meas_scale = normalization.intensity_slope
+            elif grad_norm_mode == 'none':
+                self.meas_scale = 1.0
+            else:
+                raise ValueError(f'unknown grad_norm_mode: {grad_norm_mode!r}. Choose from meas_rms, int_slope, none')
 
     @property
     def device(self):
@@ -774,7 +783,7 @@ class GaussianDiffusion(Module):
         rmses = []
 
         if self.recon:
-            print(f'[DPS] meas_scale={self.meas_scale:.3f}  grad_scale={self.grad_scale.tolist()}')
+            print(f'[DPS] grad_norm_mode={self.grad_norm_mode}  meas_scale={self.meas_scale:.3f}  grad_scale={self.grad_scale.tolist()}')
 
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
             self_cond = x_start if self.self_condition else None
@@ -837,7 +846,7 @@ class GaussianDiffusion(Module):
         rmses = []
 
         if self.recon:
-            print(f'[DPS] meas_scale={self.meas_scale:.3f}  grad_scale={self.grad_scale.tolist()}')
+            print(f'[DPS] grad_norm_mode={self.grad_norm_mode}  meas_scale={self.meas_scale:.3f}  grad_scale={self.grad_scale.tolist()}')
 
         for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
             if self.recon:

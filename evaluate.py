@@ -23,13 +23,15 @@ from denoising_diffusion_pytorch.normalization import make_normalization
 # ── config ────────────────────────────────────────────────────────────────────
 # RUN_FOLDER  = 'training_results/exp_norm_logz_dset6_lr5e-6'
 # RUN_FOLDER  = 'training_results/exp_norm_persample_dset6_lr5e-6'
-RUN_FOLDER  = 'training_results/run_all_lr_1e-4_cosine_b32_logz'
+# RUN_FOLDER  = 'training_results/run_all_lr_1e-4_cosine_b32_logz'
+RUN_FOLDER  = 'training_results/2026_06_23__15_52_06_all_lr_1e-4_cosine_b32_global_linear_unconditional'
+# RUN_FOLDER  = 'training_results/2026_06_23__18_18_11_all_lr_1e-4_cosine_b32_global_linear_pct_unconditional'
 # MODELLIST   = [1, 5, 10, 15, 20, 25, 30, 40, 50]
-MODELLIST   = [1,2,4,8,10]
+MODELLIST   = [1, 2, 3, 4, 5]
 # MODELLIST   = [1,10]
 # MODELLIST        = [1, 10, 50]
 NUM_SAMPLES      = 200
-PLOT_MS          = [1, 10]   # milestones shown in static intensity histogram
+PLOT_MS          = [1, 5]   # milestones shown in static intensity histogram
 CALC_GAUSSMATCH  = False
 CALC_W1          = False
 CALC_TVD         = True

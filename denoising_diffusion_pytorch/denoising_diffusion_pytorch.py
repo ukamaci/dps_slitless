@@ -802,11 +802,11 @@ class GaussianDiffusion(Module):
                 x_start = x_start.detach_()
 
                 if self.true is not None:
-                    rmses.append(torch.sqrt(torch.mean((self.unnormalize(img.detach().clone()) - self.true)**2, dim=(-1,-2))).cpu().numpy())
-                norms.append(norm.detach().cpu().numpy())
-                grad_norms.append(torch.linalg.norm(norm_grad.detach()).cpu().numpy())
+                    rmses.append(torch.sqrt(torch.mean((self.unnormalize(img.detach()) - self.true)**2, dim=(-1,-2))))
+                norms.append(norm.detach())
+                grad_norms.append(torch.linalg.norm(norm_grad.detach()))
                 # per-channel: spatial L2 norm, averaged over batch
-                ch_grad_norms.append(norm_grad.detach().norm(dim=(-1, -2)).mean(dim=0).cpu().numpy())
+                ch_grad_norms.append(norm_grad.detach().norm(dim=(-1, -2)).mean(dim=0))
             else:
                 img, x_start = self.p_sample(img, t, self_cond, cond = cond)
 
@@ -817,6 +817,10 @@ class GaussianDiffusion(Module):
 
         ret = self.unnormalize(ret)
         if self.recon:
+            norms = torch.stack(norms).cpu().numpy()
+            grad_norms = torch.stack(grad_norms).cpu().numpy()
+            ch_grad_norms = torch.stack(ch_grad_norms).cpu().numpy()
+            rmses = torch.stack(rmses).cpu().numpy() if rmses else np.array([])
             return ret, norms, grad_norms, rmses, ch_grad_norms
         else:
             return ret
@@ -879,10 +883,11 @@ class GaussianDiffusion(Module):
                 )
                 pred_img -= norm_grad * self.grad_scale[None,:,None,None]
                 img = pred_img.detach_()
-                norms.append(norm.detach().cpu().numpy())
-                grad_norms.append(torch.linalg.norm(norm_grad.detach()).cpu().numpy())
-                ch_grad_norms.append(norm_grad.detach().norm(dim=(-1, -2)).mean(dim=0).cpu().numpy())
-                rmses.append(torch.sqrt(torch.mean((self.unnormalize(img.detach().clone()) - self.true)**2, dim=(-1,-2))).cpu().numpy())
+                norms.append(norm.detach())
+                grad_norms.append(torch.linalg.norm(norm_grad.detach()))
+                ch_grad_norms.append(norm_grad.detach().norm(dim=(-1, -2)).mean(dim=0))
+                if self.true is not None:
+                    rmses.append(torch.sqrt(torch.mean((self.unnormalize(img.detach()) - self.true)**2, dim=(-1,-2))))
 
             else:
                 img = x_start * alpha_next.sqrt() + \
@@ -895,6 +900,10 @@ class GaussianDiffusion(Module):
 
         ret = self.unnormalize(ret)
         if self.recon:
+            norms = torch.stack(norms).cpu().numpy()
+            grad_norms = torch.stack(grad_norms).cpu().numpy()
+            ch_grad_norms = torch.stack(ch_grad_norms).cpu().numpy()
+            rmses = torch.stack(rmses).cpu().numpy() if rmses else np.array([])
             return ret, norms, grad_norms, rmses, ch_grad_norms
         else:
             return ret

@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 from denoising_diffusion_pytorch import Unet, GaussianDiffusion
 from denoising_diffusion_pytorch.normalization import make_normalization
 from slitless.forward import forward_op_torch
+from slitless.plotting import scatter_hexbin
 
 SPEEDOFLIGHT     = 299792.458
 WAVELENGTH       = 195.117937907451
@@ -15,10 +16,10 @@ WIDTH_TO_PIX      = 1.0 / DISPERSION_SCALE                         # Å    → p
 # ── config ────────────────────────────────────────────────────────────────────
 # run_folder  = './training_results/exp_norm_logz_dset6_lr5e-6'   # training run to load
 # run_folder  = './training_results/run_all_lr_1e-4_cosine_b32_logz'
-# run_folder  = './training_results/2026_06_23__15_52_06_all_lr_1e-4_cosine_b32_global_linear_unconditional'   # training run to load
-run_folder  = './training_results/2026_06_23__18_18_11_all_lr_1e-4_cosine_b32_global_linear_pct_unconditional'   # training run to load
+run_folder  = './training_results/2026_06_23__15_52_06_all_lr_1e-4_cosine_b32_global_linear_unconditional'   # training run to load
+# run_folder  = './training_results/2026_06_23__18_18_11_all_lr_1e-4_cosine_b32_global_linear_pct_unconditional'   # training run to load
 # run_folder  = './training_results/exp_norm_persample_dset6_lr5e-6'   # training run to load
-milestone      = 5                             # model-{milestone}.pt
+milestone      = 5                         # model-{milestone}.pt
 rec_mode       = 'all'
 sample_idx     = 10                              # which dset_v6 test sample to reconstruct
 numdetectors   = 0
@@ -139,7 +140,7 @@ else:
         clip_denoised=clip_denoised,
         # grad_scale=torch.tensor([0.5]).to(device),
         # grad_scale = torch.tensor([0.10, 0.08, 0.044]).to(device),   # [int, vel, width], global_linear
-        grad_scale = torch.tensor([1, 0.1, 0.3]).to(device),   # [int, vel, width], global_linear
+        grad_scale = torch.tensor([0.4, 0.4, 0.4]).to(device),   # [int, vel, width], global_linear
         grad_norm_mode=grad_norm_mode,
         forward_op=forward_op,
         device=device,
@@ -230,6 +231,17 @@ if rec_mode == 'all':
 
     plt.tight_layout(h_pad=4, rect=[0, 0, 0.9, 1])
     plt.show()
+
+    # ── hexbin scatter: true vs all samples ──────────────────────────────────
+    true_hex = true_r.copy()
+    rec_hex  = samples.copy()           # (num_samples, 3, H, W)
+    true_hex[2] *= w_fac                # width: Å → km/s
+    rec_hex[:, 2] *= w_fac
+    scatter_hexbin(
+        np.tile(true_hex.reshape(3, -1), num_samples),   # (3, num_samples*H*W)
+        rec_hex.transpose(1, 0, 2, 3).reshape(3, -1),    # (3, num_samples*H*W)
+        method_name=f'DPS — All Samples (n={num_samples})'
+    )
 
 else:
     cmap   = {'int': 'hot', 'vel': 'seismic', 'width': 'plasma'}[rec_mode]
